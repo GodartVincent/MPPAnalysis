@@ -113,6 +113,12 @@ def strat_adaptive_simple_ev(match_probas, match_gains, opp_repartition, player_
         strat_best_ev
     )
 
+def strat_highest_variance(match_probas, match_gains, opp_repartition, player_scores, my_idx):
+    """Strategy 9: Highest variance outcome."""
+    # Variance = g^2 * p * (1-p)
+    variances = (match_gains ** 2) * match_probas * (1 - match_probas)
+    return np.argmax(variances)
+
 # --- Strategy List ---
 # This list maps strategy names to their functions
 # It's imported by the main script to run the simulation
@@ -125,7 +131,8 @@ STRATEGY_FUNCTIONS = [
     strat_safe_simple_rel_ev,
     strat_adaptive_simple_rel_ev,
     strat_safe_simple_ev,
-    strat_adaptive_simple_ev
+    strat_adaptive_simple_ev,
+    strat_highest_variance
     # TODO: Add your genetic algorithm strategy here!
 ]
 
@@ -138,5 +145,6 @@ STRATEGY_NAMES = [
     "Safe Simple Rel EV",
     "Adaptive Simple Rel EV",
     "Safe Simple EV",
-    "Adaptive Simple EV"
+    "Adaptive Simple EV",
+    "Highest variance"
 ]
