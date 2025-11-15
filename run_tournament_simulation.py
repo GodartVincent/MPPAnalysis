@@ -31,7 +31,8 @@ match_params = {
     'draw_fact_min': 0.2,
     'draw_fact_max': 0.75,
     'outsider_fact_min': 1/7.5,
-    'outsider_fact_max': 1.0
+    'outsider_fact_max': 1.0,
+    'proba_fact_std': 0.06  # Std dev for probability noise when generating gains
 }
 
 
@@ -139,17 +140,10 @@ def plot_score_distributions(all_scores, strat_scores, strat_names):
              label=f"All Lambda Players (n={(len(all_scores))})")
     
     # Plot distributions for our key strategies
-    key_indices = [i for i, name in enumerate(strat_names) if name in [
-        "Best Simple EV",
-        "Best Simple Relative EV",
-        "Safe Simple Rel EV",
-        "Adaptive Simple Rel EV"
-    ]]
-    
-    for i in key_indices:
+    for i, strat_name in enumerate(strat_names):
         plt.hist(strat_scores[i], bins=100, density=True, alpha=0.8,
                  histtype='step', linewidth=2,
-                 label=f"Strategy: {strat_names[i]}")
+                 label=f"Strategy: {strat_name}")
         
     plt.title("Final Score Distributions by Strategy", fontsize=16)
     plt.xlabel("Final Score (Points)", fontsize=12)

@@ -34,19 +34,12 @@ def strat_favorite(match_probas, match_gains, opp_repartition, player_scores, my
     # It bets on the outcome with the highest probability
     return np.argmax(match_probas)
 
-def strat_safe_simple_rel_ev(match_probas, match_gains, opp_repartition, player_scores, my_idx):
-    """
-    Strategy 5: Safe Simple Relative EV.
-    Chooses best Simple Rel EV, but if it's close, checks the "risk".
-    """
-    evs = match_probas * match_gains
-    rel_evs = evs * (1 - opp_repartition)
-    
+def strat_safe(match_probas, evs):
     # If the best bet is not much better than the 2nd best,
     # check the simple probability (a proxy for risk).
-    sorted_indices = np.argsort(rel_evs)
-    best_rel_ev = rel_evs[sorted_indices[-1]]
-    second_best_rel_ev = rel_evs[sorted_indices[-2]]
+    sorted_indices = np.argsort(evs)
+    best_rel_ev = evs[sorted_indices[-1]]
+    second_best_rel_ev = evs[sorted_indices[-2]]
     
     # If the EV is too close, pick the one with the highest simple proba
     # among the top two EV bets.
@@ -55,12 +48,22 @@ def strat_safe_simple_rel_ev(match_probas, match_gains, opp_repartition, player_
             
     return sorted_indices[-1]
 
-def strat_adaptive_simple_rel_ev(match_probas, match_gains, opp_repartition, player_scores, my_idx):
+def strat_safe_simple_rel_ev(match_probas, match_gains, opp_repartition, player_scores, my_idx):
     """
-    Strategy 6: If leading, does blocking bets. If far behind, plays it aggressively.
+    Strategy 5: Safe Simple Relative EV.
+    Chooses best Simple Rel EV, but if it's close, checks the "risk".
+    """
+    evs = match_probas * match_gains
+    rel_evs = evs * (1 - opp_repartition)
+    
+    return strat_safe(match_probas, rel_evs)
+
+def strat_adaptive(match_probas, match_gains, opp_repartition, player_scores, my_idx, default_strat):
+    """
+    If leading, does blocking bets. If far behind, plays it aggressively.
     If 100+ points ahead of 2nd place, bet on the most popular bet.
     If 150+ points below the 2nd place, bet on the highest gain.
-    Otherwise, bet on the best relative EV.
+    Otherwise, follow default_strat.
     """
     my_score = player_scores[my_idx]
     
@@ -75,7 +78,40 @@ def strat_adaptive_simple_rel_ev(match_probas, match_gains, opp_repartition, pla
         # I'm far behind, play aggressively (best on highest gain)
         return np.argmax(match_gains)
     # I'm not in the lead, but not far behind either, play for best Simple Relative EV
-    return strat_best_simple_rel_ev(match_probas, match_gains, opp_repartition, player_scores, my_idx)
+    return default_strat(match_probas, match_gains, opp_repartition, player_scores, my_idx)
+
+def strat_adaptive_simple_rel_ev(match_probas, match_gains, opp_repartition, player_scores, my_idx):
+    """
+    Strategy 6: If leading, does blocking bets. If far behind, plays it aggressively.
+    If 100+ points ahead of 2nd place, bet on the most popular bet.
+    If 150+ points below the 2nd place, bet on the highest gain.
+    Otherwise, bet on the best relative EV.
+    """
+    return strat_adaptive(
+        match_probas, match_gains, opp_repartition, player_scores, my_idx,
+        strat_best_simple_rel_ev
+    )
+
+def strat_safe_simple_ev(match_probas, match_gains, opp_repartition, player_scores, my_idx):
+    """
+    Strategy 7: Safe Simple EV.
+    Chooses best Simple EV, but if it's close, checks the "risk".
+    """
+    evs = match_probas * match_gains
+    
+    return strat_safe(match_probas, evs)
+
+def strat_adaptive_simple_ev(match_probas, match_gains, opp_repartition, player_scores, my_idx):
+    """
+    Strategy 8: If leading, does blocking bets. If far behind, plays it aggressively.
+    If 100+ points ahead of 2nd place, bet on the most popular bet.
+    If 150+ points below the 2nd place, bet on the highest gain.
+    Otherwise, bet on the best EV.
+    """    
+    return strat_adaptive(
+        match_probas, match_gains, opp_repartition, player_scores, my_idx,
+        strat_best_ev
+    )
 
 # --- Strategy List ---
 # This list maps strategy names to their functions
@@ -87,7 +123,9 @@ STRATEGY_FUNCTIONS = [
     strat_best_simple_rel_ev,
     strat_favorite,
     strat_safe_simple_rel_ev,
-    strat_adaptive_simple_rel_ev
+    strat_adaptive_simple_rel_ev,
+    strat_safe_simple_ev,
+    strat_adaptive_simple_ev
     # TODO: Add your genetic algorithm strategy here!
 ]
 
@@ -98,5 +136,7 @@ STRATEGY_NAMES = [
     "Best Simple Relative EV",
     "Favorite",
     "Safe Simple Rel EV",
-    "Adaptive Simple Rel EV"
+    "Adaptive Simple Rel EV",
+    "Safe Simple EV",
+    "Adaptive Simple EV"
 ]

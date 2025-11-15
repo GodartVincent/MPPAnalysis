@@ -91,7 +91,7 @@ def simulate_full_league(
         match_params['draw_fact_min'], match_params['draw_fact_max'],
         match_params['outsider_fact_min'], match_params['outsider_fact_max']
     )
-    match_gains = generate_gains(outcome_probas, match_params['ev_avg'])
+    match_gains = generate_gains(outcome_probas, match_params['ev_avg'], match_params['proba_fact_std'])
     opp_repartition = generate_opponent_repartition(outcome_probas)
     
     player_scores = np.zeros(n_players)
