@@ -8,7 +8,10 @@ from .strategies import (
     strat_typical_opponent, 
     strat_best_ev, 
     strat_highest_variance, 
-    strat_best_simple_rel_ev
+    strat_best_simple_rel_ev,
+    strat_favorite,
+    strat_adaptive_simple_ev,
+    strat_safe_simple_ev
 )
 from .match_simulator import (
     generate_outcome_probas, 
@@ -25,7 +28,9 @@ class MppEnv(gym.Env):
                  match_params: Dict = None,
                  # --- Curriculum Arguments ---
                  num_random_opponents: int = 0,
-                 use_domain_randomization: bool = False
+                 use_domain_randomization: bool = False,
+                 use_advanced_opponents: bool = False,
+                 use_winner_reward: bool = False
                  # ----------------------------
                 ):
         super(MppEnv, self).__init__()
@@ -37,6 +42,7 @@ class MppEnv(gym.Env):
         # --- Store the curriculum settings ---
         self.num_random_opponents = num_random_opponents
         self.use_domain_randomization = use_domain_randomization
+        self.use_winner_reward = use_winner_reward
 
         # --- Define Action and Observation Spaces ---
         
@@ -59,12 +65,40 @@ class MppEnv(gym.Env):
         self.agent_idx = 0 
         
         # --- Curriculum-aware opponents ---
-        num_deterministic_opps = (n_players - 1) - self.num_random_opponents
-        
-        deterministic_strats = [strat_best_ev] * num_deterministic_opps
-        random_strats = [strat_typical_opponent] * self.num_random_opponents
-        
-        self.other_player_strategies = deterministic_strats + random_strats
+        if use_advanced_opponents:
+            # Phase 2 Mix: Adaptive, Safe, Best EV, and some Randoms
+            # We want to simulate a realistic, tough league.
+            
+            # 1. Always include a few "Random/Typical" players (noise creators)
+            num_others = (n_players - 1)
+            n_random = max(1, self.num_random_opponents)
+            random_strats = [strat_typical_opponent] * n_random
+            
+            # 2. Fill the rest with the "Elite" bots
+            n_elite = num_others - n_random
+            
+            # Cycle through our best strategies to fill the spots
+            elite_pool = [strat_adaptive_simple_ev, strat_safe_simple_ev, strat_best_ev]
+            elite_strats = []
+            for i in range(n_elite):
+                elite_strats.append(elite_pool[i % len(elite_pool)])
+                
+            self.other_player_strategies = random_strats + elite_strats
+            
+        else:
+            num_deterministic_opps = (n_players - 1) - self.num_random_opponents
+            
+            all_deterministic_strats = [
+                strat_best_ev,
+                strat_highest_variance,
+                strat_best_simple_rel_ev,
+                strat_favorite
+                ][:(n_players - 1)] + [strat_best_ev] * (n_players - 1 - 4)  # Fill remaining with best_ev
+            deterministic_strats = all_deterministic_strats[:num_deterministic_opps]
+            random_strats = [strat_typical_opponent] * self.num_random_opponents
+            
+            self.other_player_strategies = deterministic_strats + random_strats
+
         np.random.shuffle(self.other_player_strategies)
         
         self._generate_tournament()
@@ -188,20 +222,50 @@ class MppEnv(gym.Env):
         leader_score_new = np.max(opp_scores_new)
         is_agent_leading = agent_score_new > leader_score_new
 
-        # 1. The Dense "Guide" Reward
-        # Use np.sign() on the *point gap* change, just as a guide.
-        previous_gap_pts = agent_score_prev - leader_score_prev
-        current_gap_pts = agent_score_new - leader_score_new
-        gap_change_pts = current_gap_pts - previous_gap_pts
-        reward = np.sign(gap_change_pts)  # +1, -1, or 0
+        if not self.use_winner_reward:
+            # 1. The Dense "Guide" Reward
+            # Use np.sign() on the *point gap* change, just as a guide.
+            previous_gap_pts = agent_score_prev - leader_score_prev
+            current_gap_pts = agent_score_new - leader_score_new
+            gap_change_pts = current_gap_pts - previous_gap_pts
+            reward = np.sign(gap_change_pts)  # +1, -1, or 0
 
-        # 2. "Took the Lead" Event Bonus
-        if (not was_agent_leading) and is_agent_leading:
-            reward += 25  # Big, stable bonus for a critical event
+            # 2. "Took the Lead" Event Bonus
+            if (not was_agent_leading) and is_agent_leading:
+                reward += 2.5  # Big, stable bonus for a critical event
 
-        # 3. "Lost the Lead" Event Penalty
-        if was_agent_leading and (not is_agent_leading):
-            reward -= 25  # Big, stable penalty
+            # 3. "Lost the Lead" Event Penalty
+            if was_agent_leading and (not is_agent_leading):
+                reward -= 2.5  # Big, stable penalty
+        else:
+            # --- Winner's Reward : tanh Potential ---
+            # T = Temperature. 
+            T = 2*self.match_params['ev_avg']
+
+            # 1. Calculate "Potential" based on the Gap
+            # Gap = Agent - Leader (negative if losing, positive if winning)
+            previous_gap = agent_score_prev - leader_score_prev
+            current_gap = agent_score_new - leader_score_new
+
+            # Helper function for the potential
+            def get_potential(g):
+                # We normalize g/T so 60 pts = ln(2) ~= 0.69
+                x = g / T
+                return np.tanh(x)
+            
+            # Potentials
+            phi_prev = get_potential(previous_gap)
+            phi_new  = get_potential(current_gap)
+            
+            # 2. Reward is the difference in potential
+            # We scale it by 10 to keep magnitudes similar to before
+            reward = (phi_new - phi_prev) * 10.0
+
+            # 3. (Optional) Small bonus for the exact moment of taking the lead
+            # The Tanh function is steep at 0, so this is less necessary now,
+            # but it adds a nice "pop" to the signal.
+            #if (not was_agent_leading) and is_agent_leading:
+            #    reward += 1.0
 
         # 5. Prepare for next step
         self.current_match_idx += 1
@@ -212,7 +276,7 @@ class MppEnv(gym.Env):
             # Check if agent won (is #1)
             if np.argmax(self.player_scores) == self.agent_idx:
                 # A bonus larger than all others
-                reward += 100
+                reward += 10
         
         # Get new observation and info
         observation = self._get_obs() if not done else self.observation_space.sample() # Return dummy obs if done

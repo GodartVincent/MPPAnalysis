@@ -108,7 +108,7 @@ def simulate_full_league(
         # Each player makes their bet
         for p_idx in range(n_players):
             strat_func = player_strategies[p_idx]
-            bet = strat_func(m_probas, m_gains, m_repart, player_scores, p_idx)
+            bet = strat_func(m_probas, m_gains, m_repart, player_scores, p_idx, n_matches - i)
             
             if bet == true_outcome:
                 player_scores[p_idx] += m_gains[true_outcome]
