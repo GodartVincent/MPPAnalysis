@@ -3,108 +3,77 @@ import numpy as np
 from gymnasium import spaces
 from typing import List, Callable, Dict
 
-# Import all strategies we might need
+# Strategies
 from .strategies import (
-    strat_typical_opponent, 
-    strat_best_ev, 
-    strat_highest_variance, 
-    strat_best_simple_rel_ev,
-    strat_favorite,
-    strat_adaptive_simple_ev,
+    strat_typical_opponent, strat_best_ev, strat_highest_variance, 
+    strat_best_simple_rel_ev, strat_favorite, strat_adaptive_simple_ev, 
     strat_safe_simple_ev
 )
+# Simulators
 from .match_simulator import (
-    generate_outcome_probas, 
-    generate_gains, 
-    generate_opponent_repartition
+    generate_outcome_probas, generate_gains, generate_opponent_repartition
 )
+# Core (Shared Logic)
+from .core import get_v2_observation
 
 class MppEnv(gym.Env):
     metadata = {"render_modes": ["ansi"]}
 
     def __init__(self, 
-                 n_players: int = 12, 
+                 n_players: int = 12,  # Max size for player_scores in observation
                  n_matches: int = 51, 
                  match_params: Dict = None,
-                 # --- Curriculum Arguments ---
                  num_random_opponents: int = 0,
                  use_domain_randomization: bool = False,
                  use_advanced_opponents: bool = False,
                  use_winner_reward: bool = False
-                 # ----------------------------
                 ):
         super(MppEnv, self).__init__()
-
-        self.n_players = n_players
+        
+        # The fixed input size for the Neural Network
+        self.obs_n_players = n_players 
         self.n_matches = n_matches
         self.match_params = match_params
 
-        # --- Store the curriculum settings ---
-        self.num_random_opponents = num_random_opponents
+        # Settings
         self.use_domain_randomization = use_domain_randomization
         self.use_winner_reward = use_winner_reward
-
-        # --- Define Action and Observation Spaces ---
+        self.base_num_random = num_random_opponents # Base request
         
-        # Action: Bet on Favorite (0), Draw (1), or Outsider (2)
+        # Action Space
         self.action_space = spaces.Discrete(3)
 
-        # Observation: the state
-        # Simple Box (a flat vector of numbers)
-        # 1. Match Probas (3)
-        # 2. Match Gains (3)
-        # 3. Opponent Repartition (3)
-        # 4. All Player Scores (n_players)
-        # 5. Matches Remaining (1)
-        obs_size = 3 + 3 + 3 + n_players + 1
-        self.observation_space = spaces.Box(low=0, high=np.inf, shape=(obs_size,), dtype=np.float32)
+        # Observation Space (Fixed Size based on obs_n_players)
+        # 3(Probas) + 3(Gains) + 3(Repart) + (N-1)(Opp Scores) + 1(GapRatio) + 1(Time)
+        obs_size = 3 + 3 + 3 + (self.obs_n_players - 1) + 1 + 1
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32)
 
-        # --- Internal State Variables ---
-        self.player_scores = np.zeros(n_players)
+        # Internal State
         self.current_match_idx = 0
         self.agent_idx = 0 
+        self.n_active_players = n_players # Will vary per episode in Domain Rand
+        self.player_scores = np.zeros(self.n_active_players)
+        self.max_points_per_match = np.zeros(n_matches)
         
-        # --- Curriculum-aware opponents ---
-        if use_advanced_opponents:
-            # Phase 2 Mix: Adaptive, Safe, Best EV, and some Randoms
-            # We want to simulate a realistic, tough league.
-            
-            # 1. Always include a few "Random/Typical" players (noise creators)
-            num_others = (n_players - 1)
-            n_random = max(1, self.num_random_opponents)
-            random_strats = [strat_typical_opponent] * n_random
-            
-            # 2. Fill the rest with the "Elite" bots
-            n_elite = num_others - n_random
-            
-            # Cycle through our best strategies to fill the spots
-            elite_pool = [strat_adaptive_simple_ev, strat_safe_simple_ev, strat_best_ev]
-            elite_strats = []
-            for i in range(n_elite):
-                elite_strats.append(elite_pool[i % len(elite_pool)])
-                
-            self.other_player_strategies = random_strats + elite_strats
-            
-        else:
-            num_deterministic_opps = (n_players - 1) - self.num_random_opponents
-            
-            all_deterministic_strats = [
-                strat_best_ev,
-                strat_highest_variance,
-                strat_best_simple_rel_ev,
-                strat_favorite
-                ][:(n_players - 1)] + [strat_best_ev] * (n_players - 1 - 4)  # Fill remaining with best_ev
-            deterministic_strats = all_deterministic_strats[:num_deterministic_opps]
-            random_strats = [strat_typical_opponent] * self.num_random_opponents
-            
-            self.other_player_strategies = deterministic_strats + random_strats
+        # Noise Factors (Reset per episode)
+        self.repart_noise_factor = 0.0
+        self.future_estimation_error = 1.0
 
-        np.random.shuffle(self.other_player_strategies)
-        
-        self._generate_tournament()
+        # Strategy Pool initialization (Same as before)
+        self._init_strategy_pool(use_advanced_opponents, num_random_opponents, n_players)
+
+    def _init_strategy_pool(self, use_advanced, n_random, n_players):
+        """Initialize the pool of potential opponent strategies."""
+        # We create a large pool, and sample from it in reset() based on active players
+        if use_advanced:
+            # Infinite pool logic: typicals + elites
+            self.strat_pool_random = [strat_typical_opponent]
+            self.strat_pool_elite = [strat_adaptive_simple_ev, strat_safe_simple_ev, strat_best_ev]
+        else:
+            self.strat_pool_random = [strat_typical_opponent]
+            self.strat_pool_elite = [strat_best_ev, strat_highest_variance, strat_favorite]
 
     def _generate_tournament(self):
-        """Generates all match data for the entire tournament."""
         self.outcome_probas = generate_outcome_probas(
             self.n_matches,
             self.match_params['draw_fact_min'], self.match_params['draw_fact_max'],
@@ -114,175 +83,385 @@ class MppEnv(gym.Env):
                                           self.match_params['ev_avg'],
                                           self.match_params['proba_fact_std'])
         self.opp_repartition = generate_opponent_repartition(self.outcome_probas)
+        self.max_points_per_match = np.max(self.match_gains, axis=1)
 
     def _get_obs(self) -> np.ndarray:
-        """Helper function to create the observation vector."""
-        m_probas = self.outcome_probas[self.current_match_idx]
-        m_gains = self.match_gains[self.current_match_idx]
-        m_repart = self.opp_repartition[self.current_match_idx]
-        matches_remaining = np.array([self.n_matches - self.current_match_idx])
+        """Uses the shared core function to generate the observation."""
         
-        # Concatenate everything into a single, flat vector
-        obs = np.concatenate([
-            m_probas,
-            m_gains,
-            m_repart,
-            self.player_scores,
-            matches_remaining
-        ]).astype(np.float32)
+        # 1. Handle Future Points (Uncertainty)
+        if self.current_match_idx < self.n_matches:
+            true_future_max = np.sum(self.max_points_per_match[self.current_match_idx:])
+        else:
+            true_future_max = 1.0
+
+        # In Real World, we estimate this. Apply noise factor calculated in reset()
+        # If factor is 0.8, we underestimate the pot (Agent panics earlier).
+        # If factor is 1.2, we overestimate the pot (Agent stays calm too long).
+        # Note: Core function uses this for GapRatio.
+        observed_future_max = true_future_max * self.future_estimation_error
+            
+        matches_rem_fraction = (self.n_matches - self.current_match_idx) / self.n_matches
         
+        # 2. Handle Repartition Noise
+        # We apply a small perturbation to the repartition the agent sees
+        # This simulates "The model thinks 80% bet Fav, but actually 70% did."
+        raw_repart = self.opp_repartition[self.current_match_idx]
+        noisy_repart = raw_repart + np.random.normal(0, self.repart_noise_factor, 3)
+        noisy_repart = np.clip(noisy_repart, 0.01, 0.99)
+        noisy_repart /= np.sum(noisy_repart) # Renormalize# 3. Handle Variable Player Count (Top-K Logic)
+        # We have self.n_active_players scores. We need self.obs_n_players (fixed).
+        # We pass the full array to core, but core needs to handle the sorting/padding?
+        # Actually, let's do the Top-K mapping here before passing to core to be safe.
+        
+        # Agent is always index 0 in self.player_scores
+        agent_score = self.player_scores[self.agent_idx]
+        
+        # Get Opponents
+        opp_scores = np.delete(self.player_scores, self.agent_idx)
+        # Sort Opponents Descending
+        opp_scores_sorted = np.sort(opp_scores)[::-1]
+        
+        # Target size for opponents in observation
+        target_n_opps = self.obs_n_players - 1
+        
+        if len(opp_scores_sorted) >= target_n_opps:
+            # Too many players: Take Top K
+            obs_opp_scores = opp_scores_sorted[:target_n_opps]
+        else:
+            # Too few players: Pad with "Dead" scores (-9999 relative)
+            # But we construct the full score vector first
+            padding = np.full(target_n_opps - len(opp_scores_sorted), -99999.0)
+            obs_opp_scores = np.concatenate([opp_scores_sorted, padding])
+
+        # Reconstruct a "Fake" player_scores array of the correct fixed size for the core function
+        # Core expects [Agent, Opp1, Opp2...] and will calculate relative scores.
+        # If we pass [Agent, Opp1, Opp2...], core calculates Opp - Agent.
+        # -99999 will result in a relative score of (-99999 - Agent), which is super low. Perfect.
+        fixed_size_scores = np.concatenate([[agent_score], obs_opp_scores])
+
+        # Call Shared Core
+        obs, _ = get_v2_observation(
+            match_probas=self.outcome_probas[self.current_match_idx],
+            match_gains=self.match_gains[self.current_match_idx],
+            opp_repartition=noisy_repart,  # <-- Noisy
+            player_scores=fixed_size_scores, # <-- Fixed Size / Padded
+            agent_idx=0, # Agent is always 0 in our constructed array
+            future_max_points=observed_future_max, # <-- Noisy Estimation
+            matches_remaining_fraction=matches_rem_fraction,
+            ev_avg=self.match_params['ev_avg']
+        )
+        return obs
+import gymnasium as gym
+import numpy as np
+from gymnasium import spaces
+from typing import List, Callable, Dict
+
+# Import core logic
+from .core import get_v2_observation
+from .strategies import (
+    strat_typical_opponent, strat_best_ev, strat_highest_variance, 
+    strat_best_simple_rel_ev, strat_favorite, strat_adaptive_simple_ev, 
+    strat_safe_simple_ev
+)
+from .match_simulator import (
+    generate_outcome_probas, generate_gains, generate_opponent_repartition
+)
+
+class MppEnv(gym.Env):
+    metadata = {"render_modes": ["ansi"]}
+
+    def __init__(self, 
+                 n_players: int = 12,  # This is now the MAX observation size
+                 n_matches: int = 51, 
+                 match_params: Dict = None,
+                 num_random_opponents: int = 0,
+                 use_domain_randomization: bool = False,
+                 use_advanced_opponents: bool = False,
+                 use_winner_reward: bool = False
+                ):
+        super(MppEnv, self).__init__()
+        
+        # The fixed input size for the Neural Network
+        self.obs_n_players = n_players 
+        self.n_matches = n_matches
+        self.match_params = match_params
+
+        # Settings
+        self.use_domain_randomization = use_domain_randomization
+        self.use_winner_reward = use_winner_reward
+        self.base_num_random = num_random_opponents # Base request
+        
+        # Action Space
+        self.action_space = spaces.Discrete(3)
+
+        # Observation Space (Fixed Size based on obs_n_players)
+        # 3(Probas) + 3(Gains) + 3(Repart) + (N-1)(Opp Scores) + 1(GapRatio) + 1(Time)
+        obs_size = 3 + 3 + 3 + (self.obs_n_players - 1) + 1 + 1
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32)
+
+        # Internal State
+        self.current_match_idx = 0
+        self.agent_idx = 0 
+        self.n_active_players = n_players # Will vary per episode in Domain Rand
+        self.player_scores = np.zeros(self.n_active_players)
+        self.max_points_per_match = np.zeros(n_matches)
+        
+        # Noise Factors (Reset per episode)
+        self.repart_noise_factor = 0.0
+        self.future_estimation_error = 1.0
+
+        # Strategy Pool initialization (Same as before)
+        self._init_strategy_pool(use_advanced_opponents, num_random_opponents, n_players)
+
+    def _init_strategy_pool(self, use_advanced, n_random, n_players):
+        """Initialize the pool of potential opponent strategies."""
+        # We create a large pool, and sample from it in reset() based on active players
+        if use_advanced:
+            # Infinite pool logic: typicals + elites
+            self.strat_pool_random = [strat_typical_opponent]
+            self.strat_pool_elite = [strat_adaptive_simple_ev, strat_safe_simple_ev, strat_best_ev]
+        else:
+            self.strat_pool_random = [strat_typical_opponent]
+            self.strat_pool_elite = [strat_best_ev, strat_highest_variance, strat_favorite]
+
+    def _generate_tournament(self):
+        """Generates match data."""
+        self.outcome_probas = generate_outcome_probas(
+            self.n_matches,
+            self.match_params['draw_fact_min'], self.match_params['draw_fact_max'],
+            self.match_params['outsider_fact_min'], self.match_params['outsider_fact_max']
+        )
+        self.match_gains = generate_gains(self.outcome_probas,
+                                          self.match_params['ev_avg'],
+                                          self.match_params['proba_fact_std'])
+        self.opp_repartition = generate_opponent_repartition(self.outcome_probas)
+        self.max_points_per_match = np.max(self.match_gains, axis=1)
+
+    def _get_obs(self) -> np.ndarray:
+        """
+        Constructs the observation with Domain Randomization applied.
+        """
+        
+        # 1. Handle Future Points (Uncertainty)
+        if self.current_match_idx < self.n_matches:
+            true_future_max = np.sum(self.max_points_per_match[self.current_match_idx:])
+        else:
+            true_future_max = 1.0
+            
+        # In Real World, we estimate this. Apply noise factor calculated in reset()
+        # If factor is 0.8, we underestimate the pot (Agent panics earlier).
+        # If factor is 1.2, we overestimate the pot (Agent stays calm too long).
+        # Note: Core function uses this for GapRatio.
+        observed_future_max = true_future_max * self.future_estimation_error
+
+        matches_rem_fraction = (self.n_matches - self.current_match_idx) / self.n_matches
+
+        # 2. Handle Repartition Noise
+        # We apply a small perturbation to the repartition the agent sees
+        # This simulates "The model thinks 80% bet Fav, but actually 70% did."
+        raw_repart = self.opp_repartition[self.current_match_idx]
+        noisy_repart = raw_repart + np.random.normal(0, self.repart_noise_factor, 3)
+        noisy_repart = np.clip(noisy_repart, 0.01, 0.99)
+        noisy_repart /= np.sum(noisy_repart) # Renormalize
+        
+        # 3. Handle Variable Player Count (Top-K Logic)
+        # We have self.n_active_players scores. We need self.obs_n_players (fixed).
+        # We pass the full array to core, but core needs to handle the sorting/padding?
+        # Actually, let's do the Top-K mapping here before passing to core to be safe.
+        
+        # Agent is always index 0 in self.player_scores
+        agent_score = self.player_scores[self.agent_idx]
+        
+        # Get Opponents
+        opp_scores = np.delete(self.player_scores, self.agent_idx)
+        # Sort Opponents Descending
+        opp_scores_sorted = np.sort(opp_scores)[::-1]
+        
+        # Target size for opponents in observation
+        target_n_opps = self.obs_n_players - 1
+        
+        if len(opp_scores_sorted) >= target_n_opps:
+            # Too many players: Take Top K
+            obs_opp_scores = opp_scores_sorted[:target_n_opps]
+        else:
+            # Too few players: Pad with "Dead" scores (-9999 relative)
+            # But we construct the full score vector first
+            padding = np.full(target_n_opps - len(opp_scores_sorted), -99999.0)
+            obs_opp_scores = np.concatenate([opp_scores_sorted, padding])
+
+        # Reconstruct a "Fake" player_scores array of the correct fixed size for the core function
+        # Core expects [Agent, Opp1, Opp2...] and will calculate relative scores.
+        # If we pass [Agent, Opp1, Opp2...], core calculates Opp - Agent.
+        # -99999 will result in a relative score of (-99999 - Agent), which is super low. Perfect.
+        fixed_size_scores = np.concatenate([[agent_score], obs_opp_scores])
+
+        # Call Shared Core
+        obs, _ = get_v2_observation(
+            match_probas=self.outcome_probas[self.current_match_idx],
+            match_gains=self.match_gains[self.current_match_idx],
+            opp_repartition=noisy_repart,  # <-- Noisy
+            player_scores=fixed_size_scores, # <-- Fixed Size / Padded
+            agent_idx=0, # Agent is always 0 in our constructed array
+            future_max_points=observed_future_max, # <-- Noisy Estimation
+            matches_remaining_fraction=matches_rem_fraction,
+            ev_avg=self.match_params['ev_avg']
+        )
         return obs
 
     def _get_info(self) -> Dict:
-        """Helper function to return diagnostic info."""
         return {
             "current_match": self.current_match_idx,
             "agent_score": self.player_scores[self.agent_idx],
-            "leader_score": np.max(self.player_scores)
+            "leader_score": np.max(self.player_scores),
+            "n_players": self.n_active_players
         }
-
+    
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        # --- Curriculum-Aware Domain Randomization ---
+        # --- FULL DOMAIN RANDOMIZATION ---
         if self.use_domain_randomization:
-            # On each new tournament, pick new "rules"
+            # 1. Match Rules
             self.match_params['ev_avg'] = np.random.uniform(25, 45)
             self.match_params['draw_fact_min'] = np.random.uniform(0.15, 0.25)
             self.match_params['draw_fact_max'] = np.random.uniform(0.7, 0.8)
             self.match_params['outsider_fact_min'] = np.random.uniform(1/11, 1/6)
-            # Small randomness : competition with no balanced matches are rare
             self.match_params['outsider_fact_max'] = np.random.uniform(0.95, 1.0)
             self.match_params['proba_fact_std'] = np.random.uniform(0.03, 0.09)
+            
+            # 2. Noise Factors
+            # Repartition noise: between accurate to messy
+            self.repart_noise_factor = np.random.uniform(0.0, 0.25)
+            # Future Estimation: +/- 20% error
+            self.future_estimation_error = np.random.uniform(0.8, 1.2)
+            
+            # 3. Variable Player Count
+            # Randomly choose between 6 and 25 players
+            self.n_active_players = np.random.randint(4, 26)
+            
+        else:
+            # Defaults
+            self.repart_noise_factor = 0.0
+            self.future_estimation_error = 1.0
+            self.n_active_players = self.obs_n_players # Default 12
+
+        # --- Init Opponents for this Episode ---
+        # We always put the agent at idx 0
+        self.player_scores = np.zeros(self.n_active_players)
         
-        self.player_scores = np.zeros(self.n_players)
+        # Populate opponents based on n_active_players
+        # We follow the "11 Randoms" logic for Phase 4, or "Mixed" for others
+        current_opponents = []
+        n_opps_needed = self.n_active_players - 1
+        
+        if self.use_domain_randomization:
+            # In Domain Rand, we assume the hardest case: Mostly Randoms (The Crowd)
+            # But we can mix in some elites to be safe.
+            # Let's say 80% Random / 20% Elite
+            n_random = int(n_opps_needed * 0.8)
+            n_elite = n_opps_needed - n_random
+        else:
+            # Standard logic
+            n_random = self.base_num_random
+            n_elite = max(0, n_opps_needed - n_random)
+
+        # Sample strategies
+        # (In simple impl, just duplicate lists)
+        for _ in range(n_random):
+            current_opponents.append(self.strat_pool_random[0])
+        for i in range(n_elite):
+            current_opponents.append(self.strat_pool_elite[i % len(self.strat_pool_elite)])
+            
+        np.random.shuffle(current_opponents)
+        self.active_opponent_strats = current_opponents
+
         self.current_match_idx = 0
+        self.agent_idx = 0
         self._generate_tournament()
         
-        observation = self._get_obs()
-        info = self._get_info()
-        
-        return observation, info
+        return self._get_obs(), self._get_info()
 
     def step(self, action: int):
-        """
-        The agent takes an 'action' (the bet).
-        The environment simulates one match and returns the result.
-        """
-        
-        # Get data for the current match
         m_probas = self.outcome_probas[self.current_match_idx]
         m_gains = self.match_gains[self.current_match_idx]
         m_repart = self.opp_repartition[self.current_match_idx]
         
-        # --- 1. Simulate the match ---
         true_outcome = np.random.choice([0, 1, 2], p=m_probas)
         
-        # --- 2. Get bets from all players ---
+        # Map Agent Action (Sorted -> Real)
+        sort_idx = np.argsort(m_probas)[::-1]
+        agent_bet = sort_idx[action]
         
-        # The agent's bet is the 'action'
-        agent_bet = action
-        
-        # Get bets for all other players
-        other_bets = []
-        for i, strat_func in enumerate(self.other_player_strategies):
-            # We pass p_idx = i+1 because agent is 0
-            bet = strat_func(m_probas, m_gains, m_repart, self.player_scores, i + 1)
-            other_bets.append(bet)
-            
-        # --- 3. Update scores ---
+        # --- 1. CAPTURE STATE BEFORE UPDATE ---
         previous_scores = np.copy(self.player_scores)
-
-        # Agent (Player 0)
+        
+        # --- 2. UPDATE SCORES ---
+        # Agent
         if agent_bet == true_outcome:
             self.player_scores[self.agent_idx] += m_gains[true_outcome]
             
-        # Other Players (Player 1 to N-1)
-        for i, bet in enumerate(other_bets):
+        # Opponents
+        for i, strat_func in enumerate(self.active_opponent_strats):
+            p_idx = i + 1
+            # Pass 2D slices [idx:]
+            bet = strat_func(
+                match_probas=self.outcome_probas[self.current_match_idx:], 
+                match_gains=self.match_gains[self.current_match_idx:], 
+                opp_repartition=self.opp_repartition[self.current_match_idx:], 
+                player_scores=self.player_scores, 
+                my_idx=p_idx, 
+                matches_remaining=self.n_matches - self.current_match_idx,
+                ev_avg=self.match_params['ev_avg'],
+                n_matches=self.n_matches
+            )
             if bet == true_outcome:
-                self.player_scores[i + 1] += m_gains[true_outcome]
+                self.player_scores[p_idx] += m_gains[true_outcome]
 
-        # --- 4. Define the Reward ---
-        # /!\ We want to reward winning, not just scoring.
-        # We'll use a multi-part reward:
-        # 1. A dense "guide" for gaining/losing ground to the best opponent.
-        # 2. A large "event" bonus for taking the lead.
-        # 3. A large "event" penalty for losing the lead.
-        # 4. A massive "terminal" bonus for winning the tournament.
-
-        # Get the agent's and leader's rank/score *before* this match
-        agent_score_prev = previous_scores[self.agent_idx]
+        # --- 3. CALCULATE REWARD (AFFINE DECAY) ---
+        
+        # Get Leader Score (Before & After)
         opp_scores_prev = np.delete(previous_scores, self.agent_idx)
         leader_score_prev = np.max(opp_scores_prev)
-        was_agent_leading = agent_score_prev > leader_score_prev
+        agent_score_prev = previous_scores[self.agent_idx]
 
-        # Get the agent's and leader's rank/score *after* this match
-        agent_score_new = self.player_scores[self.agent_idx]
         opp_scores_new = np.delete(self.player_scores, self.agent_idx)
         leader_score_new = np.max(opp_scores_new)
-        is_agent_leading = agent_score_new > leader_score_new
+        agent_score_new = self.player_scores[self.agent_idx]
 
         if not self.use_winner_reward:
-            # 1. The Dense "Guide" Reward
-            # Use np.sign() on the *point gap* change, just as a guide.
-            previous_gap_pts = agent_score_prev - leader_score_prev
-            current_gap_pts = agent_score_new - leader_score_new
-            gap_change_pts = current_gap_pts - previous_gap_pts
-            reward = np.sign(gap_change_pts)  # +1, -1, or 0
-
-            # 2. "Took the Lead" Event Bonus
-            if (not was_agent_leading) and is_agent_leading:
-                reward += 2.5  # Big, stable bonus for a critical event
-
-            # 3. "Lost the Lead" Event Penalty
-            if was_agent_leading and (not is_agent_leading):
-                reward -= 2.5  # Big, stable penalty
+             # Legacy Dense Reward
+            gap_change = (agent_score_new - leader_score_new) - (agent_score_prev - leader_score_prev)
+            reward = np.sign(gap_change)
         else:
-            # --- Winner's Reward : tanh Potential ---
-            # T = Temperature. 
-            T = 2*self.match_params['ev_avg']
-
-            # 1. Calculate "Potential" based on the Gap
-            # Gap = Agent - Leader (negative if losing, positive if winning)
-            previous_gap = agent_score_prev - leader_score_prev
-            current_gap = agent_score_new - leader_score_new
-
-            # Helper function for the potential
-            def get_potential(g):
-                # We normalize g/T so 60 pts = ln(2) ~= 0.69
-                x = g / T
-                return np.tanh(x)
+            # Affine Decay to 0.2
+            # Dynamic Base Temperature: Scales with this tournament's ev_avg
+            T_base = 3.0 * self.match_params['ev_avg']
             
-            # Potentials
-            phi_prev = get_potential(previous_gap)
-            phi_new  = get_potential(current_gap)
+            matches_rem_prev = self.n_matches - self.current_match_idx
+            matches_rem_new = matches_rem_prev - 1
             
-            # 2. Reward is the difference in potential
-            # We scale it by 10 to keep magnitudes similar to before
+            # Formula: T = T_base * (0.2 + 0.8 * (Rem/Total))
+            decay_prev = 0.2 + 0.8 * (matches_rem_prev / self.n_matches)
+            T_prev = max(0.1, T_base * decay_prev)
+            
+            decay_new = 0.2 + 0.8 * (matches_rem_new / self.n_matches)
+            T_new = max(0.1, T_base * decay_new)
+
+            def get_potential(gap, temp): 
+                return np.tanh(gap / temp)
+            
+            phi_prev = get_potential(agent_score_prev - leader_score_prev, T_prev)
+            phi_new  = get_potential(agent_score_new - leader_score_new, T_new)
+            
             reward = (phi_new - phi_prev) * 10.0
 
-            # 3. (Optional) Small bonus for the exact moment of taking the lead
-            # The Tanh function is steep at 0, so this is less necessary now,
-            # but it adds a nice "pop" to the signal.
-            #if (not was_agent_leading) and is_agent_leading:
-            #    reward += 1.0
-
-        # 5. Prepare for next step
+        # --- 4. FINALIZE ---
         self.current_match_idx += 1
         done = (self.current_match_idx >= self.n_matches)
-
-        # 4. The Terminal Win Bonus
+        
         if done:
-            # Check if agent won (is #1)
             if np.argmax(self.player_scores) == self.agent_idx:
-                # A bonus larger than all others
-                reward += 10
+                reward += 10.0
         
-        # Get new observation and info
-        observation = self._get_obs() if not done else self.observation_space.sample() # Return dummy obs if done
-        info = self._get_info()
-        
-        # Gym API requires a 5-tuple: (obs, reward, terminated, truncated, info)
-        # 'terminated' means the episode ended naturally (we finished the tournament)
-        # 'truncated' means it ended artificially (e.g., time limit)
-        return observation, reward, done, False, info
+        obs = self._get_obs() if not done else self.observation_space.sample()
+        return obs, reward, done, False, self._get_info()
