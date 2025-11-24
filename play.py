@@ -1,12 +1,11 @@
 import os
 import numpy as np
 from stable_baselines3 import PPO
-from mpp_project.core import get_v2_observation
+from mpp_project.core import get_observation
 from mpp_project.match_simulator import generate_gains, generate_opponent_repartition
 
 # --- CONFIGURATION ---
-# Point this to the best model
-MODEL_PATH = "../models_v2/ppo_v2_phase5_domain_rand.zip" 
+MODEL_PATH = "models_v3/ppo_v3_phase4_domain_rand.zip" 
 
 # Match Constants (Standard MPP)
 EV_AVG = 35.0
@@ -27,8 +26,7 @@ def get_agent_decision(model, p_fav, p_draw, p_out, my_score, leader_score, matc
     gains = generate_gains(np.expand_dims(probas, 0), EV_AVG, 0.0)[0]
     
     # 3. Generate Repartition (Crowd Model)
-    # Phase 5 agent assumes 1-(1-p)^2. 
-    # If using V3 later, this function in match_simulator will be the Power Law one.
+    # Power Law.
     repart = generate_opponent_repartition(np.expand_dims(probas, 0))[0]
     
     # 4. Construct Scores Vector
@@ -41,7 +39,7 @@ def get_agent_decision(model, p_fav, p_draw, p_out, my_score, leader_score, matc
     scores[0] = my_score
     scores[1] = leader_score
     # Fill others with something harmless (e.g., slightly below leader)
-    scores[2:] = leader_score - 10 
+    scores[2:] = leader_score - 300 
     
     # 5. Context
     matches_remaining_fraction = matches_rem / TOTAL_MATCHES
@@ -51,7 +49,7 @@ def get_agent_decision(model, p_fav, p_draw, p_out, my_score, leader_score, matc
     future_max_points = np.max(gains) + (matches_rem - 1) * (2.0 * EV_AVG)
     
     # 6. Build Observation
-    obs, sort_idx = get_v2_observation(
+    obs, sort_idx = get_observation(
         match_probas=probas,
         match_gains=gains,
         opp_repartition=repart,
