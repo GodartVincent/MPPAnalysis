@@ -6,155 +6,130 @@ Updated to handle 2D inputs (Current + Future matches).
 import numpy as np
 import os
 from stable_baselines3 import PPO
+from .core import get_observation
 
 # --- Paths Setup ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(CURRENT_DIR)
-MODELS_DIR = os.path.join(ROOT_DIR, "models")           # V1 Models
-MODELS_V2_DIR = os.path.join(ROOT_DIR, "models_v2")     # V2 Models
 
-# ==========================================
-# 1. HELPERS: V2 Observation & Loading
-# ==========================================
+# Default Directories
+MODELS_V1_DIR = os.path.join(ROOT_DIR, "models")
+MODELS_V2_DIR = os.path.join(ROOT_DIR, "models_v2")
+MODELS_V3_DIR = os.path.join(ROOT_DIR, "models_v3")
 
-def _get_v2_obs(outcome_probas, match_gains, opp_repartition, player_scores, agent_idx, ev_avg, total_matches):
-    """
-    Constructs the V2 Observation vector from 2D match data.
-    """
-    # --- Current Match Data (Row 0) ---
-    m_probas = outcome_probas[0]
-    m_gains = match_gains[0]
-    m_repart = opp_repartition[0]
-    
-    # 1. Sort Match Data by Probability (Descending)
-    sort_idx = np.argsort(m_probas)[::-1]
-    sorted_probas = m_probas[sort_idx]
-    sorted_repart = m_repart[sort_idx]
-    
-    # 2. Normalize Gains
-    sorted_gains = m_gains[sort_idx] / ev_avg
-    
-    # 3. Process Scores (Relative & Sorted)
-    agent_score = player_scores[agent_idx]
-    relative_scores = player_scores - agent_score
-    opp_relative_scores = np.delete(relative_scores, agent_idx)
-    
-    # Sort opponents from Leader (highest relative score) to Loser
-    sorted_opp_scores = np.sort(opp_relative_scores)[::-1]
-    normalized_opp_scores = sorted_opp_scores / ev_avg
+# --- Model Caching ---
+_LOADED_MODELS = {}
 
-    # 4. Desperation Ratio
-    # Calculate Max Points Remaining (Sum of max of each future row)
-    max_points_per_match = np.max(match_gains, axis=1)
-    future_max_points = np.sum(max_points_per_match)
+def get_model(model_path, version="v3"):
+    """Lazy loads a model to avoid reloading it 5000 times."""
+    global _LOADED_MODELS
     
-    if future_max_points < 1.0: future_max_points = 1.0
-    
-    # Gap to Leader (Leader is sorted_opp_scores[0])
-    # (Agent - Leader) = -sorted_opp_scores[0] (since sorted is Opp-Agent)
-    gap_to_leader = -sorted_opp_scores[0] * ev_avg
-    gap_ratio = np.clip(gap_to_leader / future_max_points, -1.0, 1.0)
-    
-    # 5. Matches Remaining (Normalized)
-    matches_remaining_count = len(outcome_probas)
-    matches_rem_norm = np.array([matches_remaining_count / total_matches])
-    
-    # Concatenate
-    obs = np.concatenate([
-        sorted_probas,
-        sorted_gains,
-        sorted_repart,
-        normalized_opp_scores,
-        np.array([gap_ratio]),
-        matches_rem_norm
-    ]).astype(np.float32)
-    
-    return obs, sort_idx
-
-class RLStrategyWrapper:
-    def __init__(self, model_path):
-        self.model_path = model_path
-        self.model = None
-        
-    def predict(self, outcome_probas, match_gains, opp_repartition, player_scores, agent_idx, **kwargs):
-        if self.model is None:
-            if not os.path.exists(self.model_path):
-                print(f"Warning: Model not found at {self.model_path}. returning 0.")
-                return 0
-            self.model = PPO.load(self.model_path)
-        
-        ev_avg = kwargs.get('ev_avg', 35.0)
-        total_matches = kwargs.get('n_matches', 51)
-        
-        obs, sort_idx = _get_v2_obs(outcome_probas, match_gains, opp_repartition, 
-                                    player_scores, agent_idx, ev_avg, total_matches)
-        
-        action, _ = self.model.predict(obs, deterministic=True)
-        
-        # Map Action (0=Fav, 1=Mid, 2=Outsider) back to original indices
-        return int(sort_idx[action])
-
-# Initialize V2 Agents
-agent_v2_phase1 = RLStrategyWrapper(os.path.join(MODELS_V2_DIR, "ppo_v2_phase1_deterministic.zip"))
-agent_v2_phase2 = RLStrategyWrapper(os.path.join(MODELS_V2_DIR, "ppo_v2_phase2_mixed_opps.zip"))
-agent_v2_phase3 = RLStrategyWrapper(os.path.join(MODELS_V2_DIR, "ppo_v2_phase3_more_rand_opps.zip"))
-agent_v2_phase4 = RLStrategyWrapper(os.path.join(MODELS_V2_DIR, "ppo_v2_phase4_full_rand_opps.zip"))
-agent_v2_phase5 = RLStrategyWrapper(os.path.join(MODELS_V2_DIR, "ppo_v2_phase5_domain_rand.zip"))
-
-
-# ==========================================
-# 2. LEGACY HELPERS (V1)
-# ==========================================
-_LOADED_LEGACY_MODELS = {}
-
-def get_legacy_model(model_filename):
-    global _LOADED_LEGACY_MODELS
-    if model_filename not in _LOADED_LEGACY_MODELS:
-        model_path = os.path.join(MODELS_DIR, model_filename)
-        if os.path.exists(model_path):
-            print(f"Loading Legacy RL Model from {model_path}...")
-            _LOADED_LEGACY_MODELS[model_filename] = PPO.load(model_path)
+    # Resolve path
+    if not os.path.isabs(model_path):
+        # Try finding it in known dirs if not found directly
+        if version == "v3":
+            model_path = os.path.join(MODELS_V3_DIR, model_path)
+        elif version == "v2":
+            model_path = os.path.join(MODELS_V2_DIR, model_path)
         else:
-            print(f"WARNING: Legacy Model not found at {model_path}")
-            _LOADED_LEGACY_MODELS[model_filename] = None
-    return _LOADED_LEGACY_MODELS[model_filename]
-
-def _predict_with_rl_legacy(model_filename, match_probas, match_gains, opp_repartition, player_scores, my_idx, matches_remaining):
-    """Helper for Legacy Agents. Handles 2D input slicing."""
-    model = get_legacy_model(model_filename)
+            model_path = os.path.join(MODELS_V1_DIR, model_path)
     
-    # --- SLICE INPUTS FOR LEGACY AGENT ---
-    # Legacy agent only understands 1D arrays (Current Match)
+    if model_path not in _LOADED_MODELS:
+        if os.path.exists(model_path):
+            # print(f"Loading model: {model_path}") 
+            _LOADED_MODELS[model_path] = PPO.load(model_path)
+        else:
+            print(f"WARNING: Model not found at {model_path}")
+            _LOADED_MODELS[model_path] = None
+            
+    return _LOADED_MODELS[model_path]
+
+
+# ==========================================
+# 1. OBSERVATION BUILDERS
+# ==========================================
+
+def _get_legacy_obs_v1(match_probas, match_gains, opp_repartition, player_scores, my_idx, matches_remaining):
+    """V1 Observation (Legacy): Raw data, no sorting."""
     p = match_probas[0]
     g = match_gains[0]
     r = opp_repartition[0]
-    
-    if model is None:
-        # Fallback
-        evs = p * g
-        return np.argmax(evs)
-
-    # --- Construct Observation (Legacy Format) ---
-    # [Probas(3), Gains(3), Repart(3), Scores(N), MatchesRemaining(1)]
     
     my_score = player_scores[my_idx]
     other_scores = np.delete(player_scores, my_idx)
     ordered_scores = np.concatenate(([my_score], other_scores))
 
-    matches_rem_arr = np.array([float(matches_remaining)])
+    return np.concatenate([p, g, r, ordered_scores, np.array([float(matches_remaining)])]).astype(np.float32)
 
-    obs = np.concatenate([
-        p, g, r,
-        ordered_scores,
-        matches_rem_arr
-    ]).astype(np.float32)
+def _get_modern_obs(match_probas, match_gains, opp_repartition, player_scores, my_idx, **kwargs):
+    """V3 Core Builder (25 features)."""
+    ev_avg = kwargs.get('ev_avg', 35.0)
+    total_matches = kwargs.get('n_matches', 51)
 
-    action, _ = model.predict(obs, deterministic=True)
-    return int(action)
+    max_points_per_match = np.max(match_gains, axis=1)
+    future_max_points = np.sum(max_points_per_match)
+    matches_remaining_count = len(match_probas)
+    matches_rem_fraction = matches_remaining_count / total_matches
+
+    obs, sort_idx = get_observation(
+        match_probas=match_probas[0],       
+        match_gains=match_gains[0],         
+        opp_repartition=opp_repartition[0], 
+        player_scores=player_scores,
+        agent_idx=my_idx,
+        future_max_points=future_max_points,
+        matches_remaining_fraction=matches_rem_fraction,
+        ev_avg=ev_avg
+    )
+    return obs, sort_idx
 
 
 # ==========================================
-# 3. STRATEGY DEFINITIONS
+# 2. STRATEGY FACTORY
+# ==========================================
+
+def create_strategy_from_model(model_filename, version="v3", name=None):
+    """
+    Creates a strategy function from a model file.
+    
+    Args:
+        model_filename (str): Path or filename of the zip model.
+        version (str): 'v1', 'v2', or 'v3' to determine observation format.
+        name (str): Optional custom name for the strategy.
+    """
+    
+    def strategy_func(match_probas, match_gains, opp_repartition, player_scores, my_idx, matches_remaining=25, **kwargs):
+        model = get_model(model_filename, version)
+        if model is None: return 0 # Fallback to Fav
+
+        # --- V1 Legacy ---
+        if version == "v1":
+            obs = _get_legacy_obs_v1(match_probas, match_gains, opp_repartition, player_scores, my_idx, matches_remaining)
+            action, _ = model.predict(obs, deterministic=True)
+            return int(action)
+
+        # --- V2 (22 features) ---
+        elif version == "v2":
+            obs, sort_idx = _get_modern_obs(match_probas, match_gains, opp_repartition, player_scores, my_idx, **kwargs)
+            obs_v2 = obs[:22] # Slice off Simple EV
+            action, _ = model.predict(obs_v2, deterministic=True)
+            return int(sort_idx[action]) # Map back to real index
+
+        # --- V3 (25 features) ---
+        elif version == "v3":
+            obs, sort_idx = _get_modern_obs(match_probas, match_gains, opp_repartition, player_scores, my_idx, **kwargs)
+            action, _ = model.predict(obs, deterministic=True)
+            return int(sort_idx[action])
+            
+        else:
+            raise ValueError(f"Unknown agent version: {version}")
+
+    # Assign a name for the simulation report
+    strategy_func.__name__ = name if name else f"RL_{version}_{os.path.basename(model_filename)}"
+    return strategy_func
+
+# ==========================================
+# 3. HEURISTICS (Standard)
 # ==========================================
 
 def strat_typical_opponent(match_probas, match_gains, opp_repartition, player_scores, my_idx, matches_remaining=25, **kwargs):
@@ -239,31 +214,27 @@ def strat_highest_variance(match_probas, match_gains, opp_repartition, player_sc
     return np.argmax(variances)
 
 
-# --- AGENT WRAPPERS ---
+# --- RL Agents (Using Factory) ---
 
-# Legacy (V1)
-def strat_rl_v1(match_probas, match_gains, opp_repartition, player_scores, my_idx, matches_remaining=25, **kwargs):
-    """Legacy Agent (Phase 3 - 4M)."""
-    return _predict_with_rl_legacy("ppo_phase3_random_opps_4M_training.zip", match_probas, match_gains, opp_repartition, player_scores, my_idx, matches_remaining)
+# V1 Family (Legacy)
+strat_v1_legacy = create_strategy_from_model("ppo_phase3_random_opps_4M_training.zip", "v1", "RL V1 (Legacy)")
 
-# New (V2)
-def strat_rl_v2_phase1(match_probas, match_gains, opp_repartition, player_scores, my_idx, matches_remaining=25, **kwargs):
-    return agent_v2_phase1.predict(match_probas, match_gains, opp_repartition, player_scores, my_idx, **kwargs)
+# V2 Family (Affine Reward, Domain Rand, 22 Feats)
+strat_v2_p1 = create_strategy_from_model("ppo_v2_phase1_deterministic.zip", "v2", "V2 P1 (Det)")
+strat_v2_p2 = create_strategy_from_model("ppo_v2_phase2_mixed_opps.zip", "v2", "V2 P2 (Mixed)")
+strat_v2_p3 = create_strategy_from_model("ppo_v2_phase3_more_rand_opps.zip", "v2", "V3 P3 (MoreRand)")
+strat_v2_p4 = create_strategy_from_model("ppo_v2_phase4_full_rand_opps.zip", "v2", "V3 P3 (FullRand)")
+strat_v2_p5 = create_strategy_from_model("ppo_v2_phase5_domain_rand.zip", "v2", "V2 Final (DomRand)")
 
-def strat_rl_v2_phase2(match_probas, match_gains, opp_repartition, player_scores, my_idx, matches_remaining=25, **kwargs):
-    return agent_v2_phase2.predict(match_probas, match_gains, opp_repartition, player_scores, my_idx, **kwargs)
+# V3 Family (Power Law, Value Injection, 25 Feats)
+strat_v3_p1 = create_strategy_from_model("ppo_v3_phase1_deterministic.zip", "v3", "V3 P1 (Det)")
+strat_v3_p2 = create_strategy_from_model("ppo_v3_phase2_mixed_opps.zip", "v3", "V3 P2 (Mixed)")
+strat_v3_p3 = create_strategy_from_model("ppo_v3_phase3_full_rand_opps.zip", "v3", "V3 P3 (FullRand)")
+strat_v3_p4 = create_strategy_from_model("ppo_v3_phase4_domain_rand.zip", "v3", "V3 P4 (DomRand)")
 
-def strat_rl_v2_phase3(match_probas, match_gains, opp_repartition, player_scores, my_idx, matches_remaining=25, **kwargs):
-    return agent_v2_phase3.predict(match_probas, match_gains, opp_repartition, player_scores, my_idx, **kwargs)
-
-def strat_rl_v2_phase4(match_probas, match_gains, opp_repartition, player_scores, my_idx, matches_remaining=25, **kwargs):
-    return agent_v2_phase4.predict(match_probas, match_gains, opp_repartition, player_scores, my_idx, **kwargs)
-
-def strat_rl_v2_phase5(match_probas, match_gains, opp_repartition, player_scores, my_idx, matches_remaining=25, **kwargs):
-    return agent_v2_phase5.predict(match_probas, match_gains, opp_repartition, player_scores, my_idx, **kwargs)
-
-
-# --- Strategy Lists ---
+# ==========================================
+# 4. EXPORT LISTS
+# ==========================================
 
 STRATEGY_FUNCTIONS = [
     strat_typical_opponent,
@@ -276,12 +247,19 @@ STRATEGY_FUNCTIONS = [
     strat_safe_simple_ev,
     strat_adaptive_simple_ev,
     strat_highest_variance,
-    strat_rl_v1,
-    strat_rl_v2_phase1,
-    strat_rl_v2_phase2,
-    strat_rl_v2_phase3,
-    strat_rl_v2_phase4,
-    strat_rl_v2_phase5,
+    # V1 Agent
+    strat_v1_legacy,
+    # V2 Agents
+    strat_v2_p1,
+    strat_v2_p2,
+    strat_v2_p3,
+    strat_v2_p4,
+    strat_v2_p5,
+    # V3 Agents
+    strat_v3_p1,
+    strat_v3_p2,
+    strat_v3_p3,
+    strat_v3_p4
 ]
 
 STRATEGY_NAMES = [
@@ -300,5 +278,9 @@ STRATEGY_NAMES = [
     "RL V2 (P2 - Mixed)",
     "RL V2 (P3 - MoreRand)",
     "RL V2 (P4 - FullRand)",
-    "RL V2 (P5 - DomainRnd)"
+    "RL V2 (P5 - DomainRnd)",
+    "RL V3 (P1 - PPO)",
+    "RL V3 (P2 - Mixed)",
+    "RL V3 (P3 - FullRand)",
+    "RL V3 (P4 - DomainRnd)"
 ]

@@ -79,37 +79,28 @@ def generate_gains(outcome_probas: np.ndarray, ev_ref: float = 35.0, p_rand_fact
     gains = ev/mpp_probas
     return gains.astype(int)
 
-def generate_opponent_repartition(outcome_probas: np.ndarray) -> np.ndarray:
+def generate_opponent_repartition(outcome_probas, gamma=2.0):
     """
-    Simulates the repartition of bets from all other "lambda" players.
-    
-    Uses your empirical formula based on the favorite's win probability.
+    Generates the repartition of opponent bets based on win probabilities.
+    Uses a Power Law to model 'Herding' behavior (Favorite Bias).
     
     Args:
-        outcome_probas: The (n_matches, 3) array.
-
+        outcome_probas (np.ndarray): Array of shape (N, 3) with [P_fav, P_draw, P_out]
+        gamma (float): Herding factor. 
+                       1.0 = Proportional (Efficient Market)
+                       2.0 = Moderate Favorite Bias (Standard Casuals)
+                       3.0 = Strong Favorite Bias (Herding)
+    
     Returns:
-        A (n_matches, 3) numpy array of opponent bet repartitions.
+        np.ndarray: Array of shape (N, 3) with normalized bet shares.
     """
-    repartition = np.zeros_like(outcome_probas)
+    # 1. Apply Power Law
+    # We add a tiny epsilon to avoid division by zero if proba is 0 (unlikely but safe)
+    weights = np.power(outcome_probas, gamma) + 1e-9
     
-    # Get the favorite's probability for each match
-    p_fav = outcome_probas[:, 0]
-    
-    # Calculate repartition for the favorite using your formula
-    # P(bet_fav) = 1 - (1 - p_fav)^2
-    repartition_fav = 1 - (1 - p_fav)**2
-    repartition[:, 0] = repartition_fav
-    
-    # For the other two outcomes, same mechanism
-    p_remaining = 1 - repartition_fav
-    p_second_fav = outcome_probas[:, 1]
-    # Proba of betting on second favorite if favorite not bet on
-    repartition_second_fav_if_no_fav = 1 - (1 - p_second_fav)**2
-    # P(bet second fav) = P(no fav) * P(bet second fav | no fav)
-    repartition[:, 1] = p_remaining * repartition_second_fav_if_no_fav
-    
-    # The last outcome gets the rest
-    repartition[:, 2] = 1 - repartition[:, 0] - repartition[:, 1]
+    # 2. Normalize rows to sum to 1
+    # sum(axis=1) gives (N,), we need (N, 1) for broadcasting
+    sums = np.sum(weights, axis=1, keepdims=True)
+    repartition = weights / sums
     
     return repartition

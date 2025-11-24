@@ -34,9 +34,7 @@ def calculate_true_outcome_probas_from_odds(odds: list) -> np.ndarray:
         return np.zeros_like(odds)
     return inv_odds / total_inv_odds
 
-# --- NEW SHARED OBSERVATION BUILDER ---
-
-def get_v2_observation(
+def get_observation(
     match_probas: np.ndarray,      # (3,) Raw probabilities
     match_gains: np.ndarray,       # (3,) Raw gains
     opp_repartition: np.ndarray,   # (3,) Raw repartition
@@ -47,7 +45,7 @@ def get_v2_observation(
     ev_avg: float                  # Scalar: Normalization factor
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Centralized function to build the V2 observation vector.
+    Centralized function to build the observation vector.
     Used by both the Environment (training) and Strategies (inference/simulation).
     
     Returns:
@@ -80,30 +78,32 @@ def get_v2_observation(
 
     # 4. Desperation Ratio
     # Logic: (Agent - Leader) / Max_Remaining
-    # If Agent is Leader, gap is negative (Agent > Leader is impossible in relative array logic?)
-    # Wait: sorted_opp_scores contains (Opponent - Agent).
-    # So the "Leader" relative score is sorted_opp_scores[0] (The biggest positive number if losing).
-    # Gap (Agent - Leader) = -sorted_opp_scores[0].
-    
-    # Safety clip for denominator
     if future_max_points < 1.0: 
         future_max_points = 1.0
     
-    gap_to_leader = -sorted_opp_scores[0] * ev_avg # Denormalize to get raw points
+    # Leader relative score is sorted_opp_scores[0] (biggest positive gap if losing)
+    gap_to_leader = -sorted_opp_scores[0] * ev_avg 
     gap_ratio = gap_to_leader / future_max_points
     gap_ratio = np.clip(gap_ratio, -1.0, 1.0)
     
     # 5. Matches Remaining
     matches_rem_arr = np.array([matches_remaining_fraction])
+
+    # 6. Simple EV Feature (Value Detector)
+    # This explicitly gives the agent (P * G) to spot mispriced bets.
+    # Values >> 1.0 indicate "Value Bets".
+    sorted_simple_ev = sorted_probas * sorted_gains
     
     # Concatenate everything
+    # Size: 3(P) + 3(G) + 3(Repart) + (N-1)(Scores) + 1(Gap) + 1(Time) + 3(EV)
     obs = np.concatenate([
         sorted_probas,
         sorted_gains,
         sorted_repart,
         normalized_opp_scores,
         np.array([gap_ratio]),
-        matches_rem_arr
+        matches_rem_arr,
+        sorted_simple_ev
     ]).astype(np.float32)
     
     return obs, sort_idx
