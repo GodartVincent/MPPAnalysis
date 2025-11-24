@@ -7,14 +7,14 @@ from stable_baselines3.common.monitor import Monitor
 import numpy as np
 
 # Import custom environment
-from .mpp_env import MppEnv 
+from mpp_project.mpp_env import MppEnv 
 
-# --- 1. Define Absolute Paths ---
+# Define Absolute Paths
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) 
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 LOG_DIR = os.path.join(ROOT_DIR, "log")
-MODELS_DIR = os.path.join(ROOT_DIR, "models_v4") # Changed directory for V3
-TENSORBOARD_LOG_DIR = os.path.join(LOG_DIR, "ppo_mpp_tensorboard_v4")
+MODELS_DIR = os.path.join(ROOT_DIR, "models_v3")
+TENSORBOARD_LOG_DIR = os.path.join(LOG_DIR, "ppo_mpp_tensorboard_v3")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 # Define model paths
@@ -23,7 +23,7 @@ PHASE2_MODEL_PATH = os.path.join(MODELS_DIR, "ppo_v3_phase2_mixed_opps_final.zip
 PHASE3_MODEL_PATH = os.path.join(MODELS_DIR, "ppo_v3_phase3_full_rand_opps_final.zip")
 PHASE4_MODEL_PATH = os.path.join(MODELS_DIR, "ppo_v3_phase4_domain_rand_final.zip")
 
-# --- 2. Simulation Configuration ---
+# Default Simulation Configuration
 match_params = {
     'n_matches': 51,
     'ev_avg': 35,
@@ -36,7 +36,7 @@ match_params = {
 N_PLAYERS = 12
 N_MATCHES = 51
 
-# --- 3. Hyperparameters ---
+# Hyperparameters
 policy_kwargs = dict(net_arch=dict(pi=[256, 256], vf=[256, 256]))
 PHASE1_HYPERPARAMS = {
     "n_steps": 8192,
@@ -74,22 +74,13 @@ PHASE4_HYPERPARAMS = {
     "policy_kwargs": policy_kwargs,
     "ent_coef": 0.005        # Reduced entropy: Find the exploit and stick to it
 }
-PHASE5_HYPERPARAMS = {
-    "n_steps": 65536,        # Huge batch size to smooth out variance
-    "learning_rate": 1e-5,   # Tiny steps to avoid overfitting to noise
-    "gamma": 1.0,            # Long-term horizon
-    "gae_lambda": 0.95,      # Smoothing
-    "vf_coef": 1.0,          # Value function is critical here
-    "policy_kwargs": policy_kwargs,
-    "ent_coef": 0.005        # Reduced entropy: Find the exploit and stick to it
-}
 
 PHASE1_STEPS = 2_000_000
 PHASE2_STEPS = 6_000_000
 PHASE3_STEPS = 9_000_000
 PHASE4_STEPS = 13_000_000
 
-# --- Helper for Callbacks ---
+# Helper for Callbacks
 def get_callbacks(phase_name, eval_env):
     """
     Creates a list of callbacks:
@@ -120,7 +111,7 @@ def get_callbacks(phase_name, eval_env):
     
     return CallbackList([ckpt_callback, eval_callback])
 
-# --- Helper to load previous phase model ---
+# Helper to load previous phase model
 def get_transition_model_path(phase_name, fallback_path):
     """
     Smart Loader: Tries to find the 'best_model.zip' from the EvalCallback.
@@ -134,13 +125,13 @@ def get_transition_model_path(phase_name, fallback_path):
         print(f"   >>> Loading LAST model from: {fallback_path}")
         return fallback_path
 
-# --- 4. Helper to create a new logger ---
+# Helper to create a new logger
 def create_logger(phase_name: str):
     phase_log_dir = os.path.join(TENSORBOARD_LOG_DIR, phase_name)
     os.makedirs(phase_log_dir, exist_ok=True)
     return configure(phase_log_dir, ["tensorboard"])
 
-# --- 5. Main Training Curriculum ---
+# Main Training Curriculum
 def run_training_curriculum():
     
     try:
@@ -185,10 +176,10 @@ def run_training_curriculum():
                                 use_domain_randomization=False,
                                 use_winner_reward=True))
 
-            # SMART LOAD: Try to get the Best Phase 1 model, else Last
-            # (For Phase 1, Last is usually fine, but this is safe)
-            #prev_model = get_transition_model_path("phase1", PHASE1_MODEL_PATH)
+            # Load Previous Model: For Phase 1, Last is usually fine
             prev_model = PHASE1_MODEL_PATH
+            # To load best PHASE 1 model, use:
+            # prev_model = get_transition_model_path("phase1", PHASE1_MODEL_PATH)
             
             model = PPO.load(prev_model, env=env_phase2, **PHASE2_HYPERPARAMS)
             model.set_logger(create_logger("Phase2_Mixed"))
@@ -217,9 +208,10 @@ def run_training_curriculum():
                                 use_domain_randomization=False,
                                 use_winner_reward=True))
 
-            # SMART LOAD: Definitely want the BEST Phase 2 model here
-            #prev_model = get_transition_model_path("phase2", PHASE2_MODEL_PATH)
+            # Load Previous Model: Last Phase 2 model
             prev_model = PHASE2_MODEL_PATH
+            # To load best PHASE 2 model, use:
+            #prev_model = get_transition_model_path("phase2", PHASE2_MODEL_PATH)
 
             model = PPO.load(prev_model, env=env_phase3, **PHASE3_HYPERPARAMS)
             model.set_logger(create_logger("Phase3_11Randoms"))
@@ -248,9 +240,10 @@ def run_training_curriculum():
                                 use_domain_randomization=True,
                                 use_winner_reward=True))
 
-            # SMART LOAD: Best Phase 3 model
-            #prev_model = get_transition_model_path("phase3", PHASE3_MODEL_PATH)
+            # Load Previous Model: Last Phase 3 model
             prev_model = PHASE3_MODEL_PATH
+            # To load best PHASE 2 model, use:
+            #prev_model = get_transition_model_path("phase3", PHASE3_MODEL_PATH)
 
             model = PPO.load(prev_model, env=env_phase4, **PHASE4_HYPERPARAMS)
             model.set_logger(create_logger("Phase4_DomainRand"))
@@ -263,11 +256,11 @@ def run_training_curriculum():
             print(f"--- SKIPPING Phase 4 (Found) ---")
             
     except KeyboardInterrupt:
-        print("\n\n!!! INTERRUPTED BY USER (Ctrl+C) !!!")
+        print("\n\nINTERRUPTED BY USER (Ctrl+C)")
         if 'model' in locals():
             model.save(os.path.join(MODELS_DIR, "model_INTERRUPTED.zip"))
-            print("Saved emergency backup.")
+            print("Saved backup.")
 
-# --- 7. Run the script ---
+# Run the script
 if __name__ == "__main__":
     run_training_curriculum()

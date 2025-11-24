@@ -6,7 +6,7 @@ from typing import List, Callable, Dict
 # Strategies
 from .strategies import (
     strat_typical_opponent, strat_best_ev, strat_highest_variance, 
-    strat_best_simple_rel_ev, strat_favorite, strat_adaptive_simple_ev, 
+    strat_favorite, strat_adaptive_simple_ev, 
     strat_safe_simple_ev
 )
 # Simulators
@@ -17,6 +17,10 @@ from .match_simulator import (
 from .core import get_observation
 
 class MppEnv(gym.Env):
+    """
+    Custom Environment for the MonPetitProno Tournament.
+    Supports Domain Randomization, Power Law Opponents, and Variable League Sizes.
+    """
     metadata = {"render_modes": ["ansi"]}
 
     def __init__(self, 
@@ -32,18 +36,17 @@ class MppEnv(gym.Env):
                 ):
         super(MppEnv, self).__init__()
         
-        # The fixed input size for the Neural Network
+        # The fixed input size for the Neural Network (Padding / Top-K Logic)
         self.obs_n_players = n_players 
         self.n_matches = n_matches
         self.match_params = match_params
 
-        # --- Store the curriculum settings ---
+        # Store the curriculum settings
         self.use_domain_randomization = use_domain_randomization
         self.use_winner_reward = use_winner_reward
         self.base_num_random = num_random_opponents
         
-        # --- Define Action and Observation Spaces ---
-        # Action: Bet on Favorite (0), Draw (1), or Outsider (2) (Mapped by probability sorting)
+        # Action Space: Bet on Favorite (0), Draw (1), or Outsider (2) (Mapped by probability sorting)
         self.action_space = spaces.Discrete(3)
 
         # Observation Space (Fixed Size based on obs_n_players)
@@ -53,29 +56,28 @@ class MppEnv(gym.Env):
         # 4. All Player Scores (n_players - 1 relative to agent)
         # 5. Gap Ratio (1)
         # 6. Time Remaining (1)
-        # 7. Simple EV (3) [NEW in V3]
+        # 7. Simple EV (3)
         obs_size = 3 + 3 + 3 + (self.obs_n_players - 1) + 1 + 1 + 3
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32)
 
-        # --- Internal State Variables ---
+        # Internal State Variables
         self.current_match_idx = 0
         self.agent_idx = 0 
         self.n_active_players = n_players # Will vary per episode in Domain Rand
         self.player_scores = np.zeros(self.n_active_players)
         self.max_points_per_match = np.zeros(n_matches)
         
-        # --- Domain Parameters (Initialized in reset) ---
+        # Domain Parameters (Initialized in reset)
         self.repart_noise_factor = 0.0
         self.future_estimation_error = 1.0
-        self.repartition_gamma = 2.0 # Default for Phase 2/3/4
+        self.repartition_gamma = 2.0
 
-        # --- Strategy Pool initialization ---
+        # Strategy Pool Initialization
         self._init_strategy_pool(use_advanced_opponents)
 
     def _init_strategy_pool(self, use_advanced):
         """Initialize the pool of potential opponent strategies."""
         if use_advanced:
-            # Infinite pool logic: typicals + elites
             self.strat_pool_random = [strat_typical_opponent]
             self.strat_pool_elite = [strat_adaptive_simple_ev, strat_safe_simple_ev, strat_best_ev]
         else:
@@ -83,7 +85,7 @@ class MppEnv(gym.Env):
             self.strat_pool_elite = [strat_best_ev, strat_highest_variance, strat_favorite]
 
     def _generate_tournament(self):
-        """Generates match data for the entire tournament."""
+        """Generates match data."""
         self.outcome_probas = generate_outcome_probas(
             self.n_matches,
             self.match_params['draw_fact_min'], self.match_params['draw_fact_max'],
@@ -93,39 +95,34 @@ class MppEnv(gym.Env):
                                           self.match_params['ev_avg'],
                                           self.match_params['proba_fact_std'])
         
-        # Use the gamma determined in reset() (Power Law Logic)
+        # Use the Power Law Repartition, (gamma randomized in reset)
         self.opp_repartition = generate_opponent_repartition(
             self.outcome_probas, 
             gamma=self.repartition_gamma
         )
-        
         self.max_points_per_match = np.max(self.match_gains, axis=1)
 
     def _get_obs(self) -> np.ndarray:
-        """
-        Constructs the observation with Domain Randomization applied.
-        Uses the shared core function to generate the observation vector.
-        """
+        """Constructs the observation with Domain Randomization noise."""
         
-        # 1. Handle Future Points (Uncertainty)
+        # 1. Future Points (Noisy Estimation)
         if self.current_match_idx < self.n_matches:
             true_future_max = np.sum(self.max_points_per_match[self.current_match_idx:])
         else:
             true_future_max = 1.0
             
-        # Apply estimation noise (Domain Randomization feature)
+        # Apply estimation noise
         observed_future_max = true_future_max * self.future_estimation_error
 
         matches_rem_fraction = (self.n_matches - self.current_match_idx) / self.n_matches
 
-        # 2. Handle Repartition Noise
+        # 2. Repartition Noise
         raw_repart = self.opp_repartition[self.current_match_idx]
         noisy_repart = raw_repart + np.random.normal(0, self.repart_noise_factor, 3)
         noisy_repart = np.clip(noisy_repart, 0.01, 0.99)
         noisy_repart /= np.sum(noisy_repart)
         
-        # 3. Handle Variable Player Count (Top-K Logic)
-        # We must ensure the observation vector size is constant (obs_n_players)
+        # 3. Handle Variable Player Count (Top-K Logic & Padding)
         agent_score = self.player_scores[self.agent_idx]
         opp_scores = np.delete(self.player_scores, self.agent_idx)
         opp_scores_sorted = np.sort(opp_scores)[::-1]
@@ -136,7 +133,7 @@ class MppEnv(gym.Env):
             # Too many players: Take Top K
             obs_opp_scores = opp_scores_sorted[:target_n_opps]
         else:
-            # Too few players: Pad with "Dead" scores
+            # Too few players: Pad with "Dead" scores (-99999.0)
             padding = np.full(target_n_opps - len(opp_scores_sorted), -99999.0)
             obs_opp_scores = np.concatenate([opp_scores_sorted, padding])
 
@@ -168,7 +165,7 @@ class MppEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        # --- FULL DOMAIN RANDOMIZATION ---
+        # Domain Randomization
         if self.use_domain_randomization:
             # 1. Match Rules
             self.match_params['ev_avg'] = np.random.uniform(25, 45)
@@ -176,7 +173,7 @@ class MppEnv(gym.Env):
             self.match_params['draw_fact_max'] = np.random.uniform(0.7, 0.8)
             self.match_params['outsider_fact_min'] = np.random.uniform(1/11, 1/6)
             self.match_params['outsider_fact_max'] = np.random.uniform(0.95, 1.0)
-            self.match_params['proba_fact_std'] = np.random.uniform(0.03, 0.20) # Increased for Value Injection
+            self.match_params['proba_fact_std'] = np.random.uniform(0.03, 0.20)
             
             # 2. Noise Factors
             self.repart_noise_factor = np.random.uniform(0.0, 0.15)
@@ -189,11 +186,11 @@ class MppEnv(gym.Env):
             self.repartition_gamma = np.random.uniform(1.5, 3.0)
             
         else:
-            # Defaults for Training Phases 1-4
+            # Defaults
             self.repart_noise_factor = 0.0
             self.future_estimation_error = 1.0
             self.n_active_players = self.obs_n_players
-            self.repartition_gamma = 2.0  # Standard Casual Crowd
+            self.repartition_gamma = 2.0
 
         # --- Init Opponents for this Episode ---
         self.player_scores = np.zeros(self.n_active_players)
@@ -230,28 +227,25 @@ class MppEnv(gym.Env):
         """
         m_probas = self.outcome_probas[self.current_match_idx]
         m_gains = self.match_gains[self.current_match_idx]
-        m_repart = self.opp_repartition[self.current_match_idx]
         
-        # --- 1. Simulate the match ---
+        # Simulate the match
         true_outcome = np.random.choice([0, 1, 2], p=m_probas)
         
-        # --- 2. Map Agent Action ---
+        # Map Agent Action
         # Reconstruct the sort order to know what the agent picked
         sort_idx = np.argsort(m_probas)[::-1]
         agent_bet = sort_idx[action]
         
-        # --- 3. Capture State BEFORE Update ---
+        # Capture State before Update
         previous_scores = np.copy(self.player_scores)
         
-        # --- 4. Update Scores ---
-        # Agent
+        # Update Agent
         if agent_bet == true_outcome:
             self.player_scores[self.agent_idx] += m_gains[true_outcome]
             
-        # Opponents
+        # Update Opponents
         for i, strat_func in enumerate(self.active_opponent_strats):
             p_idx = i + 1
-            # Pass 2D slices [idx:]
             bet = strat_func(
                 match_probas=self.outcome_probas[self.current_match_idx:], 
                 match_gains=self.match_gains[self.current_match_idx:], 
@@ -265,8 +259,7 @@ class MppEnv(gym.Env):
             if bet == true_outcome:
                 self.player_scores[p_idx] += m_gains[true_outcome]
 
-        # --- 5. Calculate Reward ---
-        # Get Leader Score (Before & After)
+        # Reward (Affine Decay)
         opp_scores_prev = np.delete(previous_scores, self.agent_idx)
         leader_score_prev = np.max(opp_scores_prev)
         agent_score_prev = previous_scores[self.agent_idx]
@@ -280,7 +273,7 @@ class MppEnv(gym.Env):
             gap_change = (agent_score_new - leader_score_new) - (agent_score_prev - leader_score_prev)
             reward = np.sign(gap_change)
         else:
-            # --- ADAPTIVE Temperature Tanh Reward ---
+            # Adaptive Temperature Tanh Reward
             # Dynamic Base Temperature: Scales with this tournament's ev_avg
             T_base = 3.0 * self.match_params['ev_avg']
             
@@ -302,7 +295,6 @@ class MppEnv(gym.Env):
             
             reward = (phi_new - phi_prev) * 10.0
 
-        # --- 6. Finalize ---
         self.current_match_idx += 1
         done = (self.current_match_idx >= self.n_matches)
         

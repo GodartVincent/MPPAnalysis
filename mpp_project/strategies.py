@@ -1,6 +1,5 @@
 """
 Defines the different betting strategies to be compared in the simulation.
-Updated to handle 2D inputs (Current + Future matches).
 """
 
 import numpy as np
@@ -8,7 +7,7 @@ import os
 from stable_baselines3 import PPO
 from .core import get_observation
 
-# --- Paths Setup ---
+# Paths Setup
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(CURRENT_DIR)
 
@@ -17,16 +16,16 @@ MODELS_V1_DIR = os.path.join(ROOT_DIR, "models")
 MODELS_V2_DIR = os.path.join(ROOT_DIR, "models_v2")
 MODELS_V3_DIR = os.path.join(ROOT_DIR, "models_v3")
 
-# --- Model Caching ---
+# Model Caching
 _LOADED_MODELS = {}
 
 def get_model(model_path, version="v3"):
-    """Lazy loads a model to avoid reloading it 5000 times."""
+    """Loads a model to avoid reloading it 5000 times."""
     global _LOADED_MODELS
     
     # Resolve path
     if not os.path.isabs(model_path):
-        # Try finding it in known dirs if not found directly
+        # Try finding it in known dirs
         if version == "v3":
             model_path = os.path.join(MODELS_V3_DIR, model_path)
         elif version == "v2":
@@ -36,12 +35,10 @@ def get_model(model_path, version="v3"):
     
     if model_path not in _LOADED_MODELS:
         if os.path.exists(model_path):
-            # print(f"Loading model: {model_path}") 
             _LOADED_MODELS[model_path] = PPO.load(model_path)
         else:
             print(f"WARNING: Model not found at {model_path}")
             _LOADED_MODELS[model_path] = None
-            
     return _LOADED_MODELS[model_path]
 
 
@@ -102,20 +99,20 @@ def create_strategy_from_model(model_filename, version="v3", name=None):
         model = get_model(model_filename, version)
         if model is None: return 0 # Fallback to Fav
 
-        # --- V1 Legacy ---
+        # V1 Legacy
         if version == "v1":
             obs = _get_legacy_obs_v1(match_probas, match_gains, opp_repartition, player_scores, my_idx, matches_remaining)
             action, _ = model.predict(obs, deterministic=True)
             return int(action)
 
-        # --- V2 (22 features) ---
+        # V2 (22 features)
         elif version == "v2":
             obs, sort_idx = _get_modern_obs(match_probas, match_gains, opp_repartition, player_scores, my_idx, **kwargs)
             obs_v2 = obs[:22] # Slice off Simple EV
             action, _ = model.predict(obs_v2, deterministic=True)
             return int(sort_idx[action]) # Map back to real index
 
-        # --- V3 (25 features) ---
+        # V3 (25 features)
         elif version == "v3":
             obs, sort_idx = _get_modern_obs(match_probas, match_gains, opp_repartition, player_scores, my_idx, **kwargs)
             action, _ = model.predict(obs, deterministic=True)
@@ -133,7 +130,7 @@ def create_strategy_from_model(model_filename, version="v3", name=None):
 # ==========================================
 
 def strat_typical_opponent(match_probas, match_gains, opp_repartition, player_scores, my_idx, matches_remaining=25, **kwargs):
-    """Bet on the favorite with a proba of 1 - (1-p_favorite)**2."""
+    """Random bet following opp_repartition."""
     # Slice [0] to use current match
     return np.random.choice([0, 1, 2], p=opp_repartition[0])
 
@@ -143,7 +140,6 @@ def strat_random(match_probas, match_gains, opp_repartition, player_scores, my_i
 
 def strat_best_ev(match_probas, match_gains, opp_repartition, player_scores, my_idx, matches_remaining=25, **kwargs):
     """Bet on the outcome with the highest simple EV."""
-    # Slice [0]
     evs = match_probas[0] * match_gains[0]
     return np.argmax(evs)
 
@@ -158,7 +154,7 @@ def strat_favorite(match_probas, match_gains, opp_repartition, player_scores, my
     return np.argmax(match_probas[0])
 
 def strat_safe(match_probas, evs):
-    # Helper for safe strategies (Logic unchanged)
+    # Helper for safe strategies : if best EV is too close to second best, pick the more probable
     sorted_indices = np.argsort(evs)
     best_rel_ev = evs[sorted_indices[-1]]
     second_best_rel_ev = evs[sorted_indices[-2]]
@@ -214,7 +210,9 @@ def strat_highest_variance(match_probas, match_gains, opp_repartition, player_sc
     return np.argmax(variances)
 
 
-# --- RL Agents (Using Factory) ---
+# ==========================================
+# 4. RL AGENTS
+# ==========================================
 
 # V1 Family (Legacy)
 strat_v1_legacy = create_strategy_from_model("ppo_phase3_random_opps_4M_training.zip", "v1", "RL V1 (Legacy)")
@@ -233,7 +231,7 @@ strat_v3_p3 = create_strategy_from_model("ppo_v3_phase3_full_rand_opps.zip", "v3
 strat_v3_p4 = create_strategy_from_model("ppo_v3_phase4_domain_rand.zip", "v3", "V3 P4 (DomRand)")
 
 # ==========================================
-# 4. EXPORT LISTS
+# 5. EXPORT LISTS
 # ==========================================
 
 STRATEGY_FUNCTIONS = [

@@ -3,8 +3,6 @@ Main script to run the MonPetitProno (MPP) tournament simulation.
 
 This script simulates a full competition (e.g., World Cup) multiple times
 to compare the performance of different betting strategies.
-
-UPDATED: Now uses Paired Evaluation and tracks detailed Ranking statistics.
 """
 
 import numpy as np
@@ -22,11 +20,11 @@ from mpp_project.match_simulator import (
     generate_opponent_repartition
 )
 
-# --- Simulation Configuration ---
-N_SAMPLES = 10000
+# Simulation Configuration
+N_SAMPLES = 20000
 N_PLAYERS = 12        
 
-# --- Match Simulation Parameters ---
+# Match Simulation Parameters
 match_params = {
     'n_matches': 51,
     'ev_avg': 35,
@@ -37,11 +35,11 @@ match_params = {
     'proba_fact_std': 0.06 
 }
 
-# --- Helper Function for Printing Results ---
+# Helper Function for Printing Results
 def print_results(names: List[str], first_place_counts: np.ndarray, n_simulations: int, scores_by_strats: List[List[float]]):
     """Prints a formatted table of the simulation results."""
     
-    print(f"\n---------- Simulation Results ({n_simulations} tournaments per strategy) -----------")
+    print(f"\n---------- Simulation Results ({n_simulations} tournaments per strategy) ----------")
     print("Strategy                 | Win Rate | Avg Points |   Median   |  Std Dev  ")
     print("-------------------------------------------------------------------------")
     
@@ -58,13 +56,12 @@ def print_results(names: List[str], first_place_counts: np.ndarray, n_simulation
         std_points = np.std(scores_by_strats[idx])
         print(f"{names[idx]:<25}| {win_rate_pct:>7.2f}% | {avg_points:>7.1f}pts | {med_points:>7.1f}pts | {std_points:>6.2f}pts")
 
-# --- Main Simulation Loop ---
+# Main Simulation Loop
 def run_simulation():
     
     challenger_indices = [i for i, name in enumerate(STRATEGY_NAMES) if name != "Typical Opponent"]
-    n_challengers = len(challenger_indices)
     
-    # --- Statistics Trackers ---
+    # Statistics Trackers
     n_times_first = np.zeros(len(STRATEGY_NAMES), dtype=int)
     final_scores_all_players = [] 
     final_scores_by_strat = [[] for _ in range(len(STRATEGY_NAMES))]
@@ -77,7 +74,7 @@ def run_simulation():
     
     for i_sample in tqdm(range(N_SAMPLES)):
         
-        # --- 1. Generate the Tournament ONCE for this iteration ---
+        # 1. Generate the Tournament for this iteration
         outcome_probas = generate_outcome_probas(
             match_params['n_matches'], 
             match_params['draw_fact_min'], match_params['draw_fact_max'],
@@ -92,7 +89,7 @@ def run_simulation():
             'repart': opp_repartition
         }
         
-        # --- 2. Run simulations for each challenger ---
+        # 2. Run simulations for each challenger
         for i_challenger_idx in challenger_indices:
             
             challenger_func = STRATEGY_FUNCTIONS[i_challenger_idx]
@@ -108,7 +105,7 @@ def run_simulation():
                 precomputed_tournament=tournament_data 
             )
             
-            # --- 3. Tally Results ---
+            # 3. Tally Results
             challenger_score = final_league_scores[0]
             max_score = np.max(final_league_scores)
             
@@ -129,7 +126,7 @@ def run_simulation():
         if (i_sample + 1) % 1000 == 0:
             print_results(STRATEGY_NAMES, n_times_first, i_sample + 1, final_scores_by_strat)
             
-    # --- 4. Final Results ---
+    # 4. Final Results
     print("\n" + "#" * 30)
     print("  Final Simulation Results")
     print("#" * 30)
@@ -137,7 +134,7 @@ def run_simulation():
     
     return final_scores_all_players, final_scores_by_strat, rank_counts
 
-# --- Plotting Functions ---
+# Plotting Functions
 def plot_score_distributions(all_scores, strat_scores, strat_names):
     plt.figure(figsize=(14, 8))
     
