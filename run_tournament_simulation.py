@@ -26,7 +26,7 @@ N_PLAYERS = 12
 
 # Match Simulation Parameters
 match_params = {
-    'n_matches': 51,
+    'n_matches': 104,
     'ev_avg': 35,
     'draw_fact_min': 0.2,
     'draw_fact_max': 0.75,

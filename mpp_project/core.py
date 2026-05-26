@@ -2,9 +2,29 @@
 Core logic and utility functions for the MonPetitProno (MPP) analysis project.
 """
 
+import pandas as pd
 import numpy as np
+import unicodedata
 from scipy.stats import binom
 from typing import Tuple
+
+# --- CONSTANTES DU MODÈLE MPP (À mettre à jour avec les résultats du Notebook 12_) ---
+# Constantes permettant de convertir un gain MPP en probabilité vraie d'outcome via une courbe cubique.
+CUBIC_A = -244.3   # Paramètre d'ordre 3
+CUBIC_B = 497.7    # Paramètre d'ordre 2
+CUBIC_C = -460.5   # Paramètre d'ordre 1
+CUBIC_D = 206.3    # Paramètre d'ordre 0
+RMSE_GAINS = 9.75  # RMSE du fit : ecart-type du bruit gaussien à ajouter au gain pour simuler des probas réalistes.
+
+# --- CONSTANTES DU MODÈLE DE FOULE SOFTMAX (À mettre à jour avec les résultats du Notebook 13_) ---
+CROWD_BETA = 2.24       # Paramètre de sur-réaction aux favoris
+CROWD_EPSILON = 0.009   # Plancher incompressible (0.9%) pour les trolls/clics fous
+RMSE_CROWD = 0.083      # RMSE du fit : ecart-type du bruit gaussien à ajouter au crowd pour les simuler de manière réaliste.
+
+MIN_MPP_GAIN = 15.0  # Gain MPP minimum réaliste (allemaagne - curacao : 15.0)
+MAX_MPP_GAIN = 225.0  # Gain MPP maximum réaliste (allemaagne - curacao : 222.0)
+MIN_TRUE_PROBA = 0.02  # Probabilité minimale réaliste d'une issue (allemaagne - curacao : 0.02)
+MAX_TRUE_PROBA = 0.95  # Probabilité maximale réaliste d'une issue (allemaagne - curacao : 0.95)
 
 def calculate_win_probability(min_successes: int, num_matches: int, success_prob: float) -> float:
     """
@@ -26,13 +46,39 @@ def get_ev_with_bonus(outcome_prob: float, perfect_prob_given_outcome: float, po
     expected_points_given_outcome = points * (1.0 + perfect_prob_given_outcome)
     return outcome_prob * expected_points_given_outcome
 
-def calculate_true_outcome_probas_from_odds(odds: list) -> np.ndarray:
-    """Calculates normalized ground truth probabilities from bookmaker odds."""
-    inv_odds = 1.0 / np.array(odds)
-    total_inv_odds = np.sum(inv_odds)
-    if total_inv_odds == 0:
-        return np.zeros_like(odds)
-    return inv_odds / total_inv_odds
+def calculate_true_outcome_probas_from_odds(odds: np.ndarray) -> np.ndarray:
+    """
+    Calculates normalized ground truth probabilities from bookmaker odds.
+    Expects odds to be a NumPy array of shape (N, 3) or (3,).
+    """
+    # Conversion en float pour éviter les divisions entières ou les types mixtes
+    odds_array = np.asarray(odds, dtype=float)
+    
+    # 1. Calcul de l'inverse des cotes
+    inv_odds = 1.0 / odds_array
+    
+    # 2. Somme par ligne (par match)
+    # Si le tableau a une seule dimension (ex: un seul match [2.0, 3.0, 3.0]), 
+    # sum() s'applique normalement. Si c'est 2D (N, 3), on utilise axis=1.
+    if inv_odds.ndim == 2:
+        total_inv_odds = np.sum(inv_odds, axis=1, keepdims=True)
+    else:
+        total_inv_odds = np.sum(inv_odds)
+        
+    # 3. Sécurité contre la division par zéro
+    # np.where est très puissant pour faire des conditions sans boucle for
+    safe_total = np.where(total_inv_odds == 0, 1.0, total_inv_odds)
+    
+    # 4. Normalisation
+    true_probas = inv_odds / safe_total
+    
+    # On remet à zéro les lignes où le total était nul
+    if inv_odds.ndim == 2:
+        true_probas = np.where(total_inv_odds == 0, 0.0, true_probas)
+    else:
+        true_probas = np.where(total_inv_odds == 0, 0.0, true_probas)
+        
+    return true_probas
 
 def get_observation(
     match_probas: np.ndarray,      # (3,) Raw probabilities
@@ -107,3 +153,286 @@ def get_observation(
     ]).astype(np.float32)
     
     return obs, sort_idx
+
+def normalize_team_name(name):
+    """
+    Standardise les noms d'équipes : 
+    'Corée du Sud' -> 'coree_du_sud'
+    'République Tchèque' -> 'republique_tcheque'
+    """
+    if pd.isna(name):
+        return name
+        
+    # 1. Convertir en chaîne de caractères
+    name = str(name)
+    
+    # 2. Supprimer les accents (décomposition Unicode puis filtrage)
+    name = ''.join(c for c in unicodedata.normalize('NFD', name)
+                   if unicodedata.category(c) != 'Mn')
+                   
+    # 3. Mettre en minuscules
+    name = name.lower()
+    
+    # 4. Remplacer les espaces et les tirets par des underscores
+    name = name.replace(' ', '_').replace('-', '_')
+    
+    return name
+
+def load_tournament_data(csv_path):
+    """
+    Charge le CSV du tournoi, normalise le texte, et calcule les probabilités réelles.
+    Gère dynamiquement les phases sans constantes codées en dur.
+    """
+    # Chargement brut
+    df = pd.read_csv(csv_path)
+    
+    # --- 1. NORMALISATION DU TEXTE ---
+    df['team_A'] = df['team_A'].apply(normalize_team_name)
+    df['team_B'] = df['team_B'].apply(normalize_team_name)
+    
+    # Optionnel mais propre : convertir la colonne date en vrai format Date Python
+    df['date'] = pd.to_datetime(df['date'])
+    
+    # --- 2. CALCUL DES PROBABILITÉS RÉELLES (Overround Normalization) ---
+    cotes = df[['cote_1', 'cote_N', 'cote_2']].values
+    
+    # Formule : P(X) = (1 / cote_X) / Somme(1 / cotes)
+    true_probas = calculate_true_outcome_probas_from_odds(cotes)
+    
+    # Ajout au DataFrame pour visualisation dans les notebooks
+    df['true_proba_1'] = true_probas[:, 0]
+    df['true_proba_N'] = true_probas[:, 1]
+    df['true_proba_2'] = true_probas[:, 2]
+    
+    # --- 3. EXTRACTION DES MATRICES POUR L'ORACLE ---
+    mpp_gains = df[['gain_mpp_1', 'gain_mpp_N', 'gain_mpp_2']].values
+    
+    # Extraction et Normalisation des Foules
+    raw_crowds = df[['crowd_1', 'crowd_N', 'crowd_2']].values
+    crowd_sums = raw_crowds.sum(axis=1, keepdims=True)
+    
+    # On divise par la somme pour garantir un total strict de 1.0
+    # (Le 'where' et 'out' protègent contre une éventuelle ligne vide qui causerait une division par 0)
+    crowd_repartitions = np.divide(
+        raw_crowds, 
+        crowd_sums, 
+        out=np.zeros_like(raw_crowds), 
+        where=crowd_sums!=0
+    )
+    
+    return df, true_probas, mpp_gains, crowd_repartitions
+
+def estimate_proba_from_gain_cubic(gain, a=CUBIC_A, b=CUBIC_B, c=CUBIC_C, d=CUBIC_D):
+    """
+    Retrouve la probabilitévraie 'p' en cherchant les racines du polynôme cubique :
+    a*p³ + b*p² + c*p + (d - Gain) = 0
+    """
+    coeffs = [a, b, c, d - gain]
+    racines = np.roots(coeffs)
+    racines_reelles = racines.real[abs(racines.imag) < 1e-5]
+    valid_p = [r for r in racines_reelles if 0.0 <= r <= 1.0]
+    
+    if len(valid_p) > 0:
+        return max(MIN_TRUE_PROBA, min(MAX_TRUE_PROBA, valid_p[0]))
+    else:
+        # Fallback de sécurité si le gain demandé est totalement hors courbe
+        return MAX_TRUE_PROBA if gain < MIN_MPP_GAIN else MIN_TRUE_PROBA
+
+def simulate_true_proba_from_gain(gain_mpp, rmse=RMSE_GAINS, a=CUBIC_A, b=CUBIC_B, c=CUBIC_C, d=CUBIC_D):
+    """
+    Simule une true_proba réaliste à partir d'un gain MPP connu.
+    Intègre le bruit statistique (RMSE) découvert lors de la modélisation de gain à partir de p (voir notebook 12_).
+    """
+    # 1. Ajout du bruit gaussien
+    bruit = np.random.normal(0, rmse)
+    noisy_gain = gain_mpp + bruit
+    
+    # Sécurité : le gain MPP ne descend jamais sous un certain plancher (souvent 10 ou 12)
+    # On empêche le bruit de créer des gains aberrants comme -5 pts.
+    noisy_gain = max(MIN_MPP_GAIN, noisy_gain)
+    
+    # 2. Inversion de la courbe avec le gain bruité
+    proba_est = estimate_proba_from_gain_cubic(noisy_gain, a, b, c, d)
+
+    # 3. securité : on s'assure que la proba est dans [MIN_TRUE_PROBA, MAX_TRUE_PROBA].
+    proba_est = max(MIN_TRUE_PROBA, min(MAX_TRUE_PROBA, proba_est))
+
+    return proba_est
+
+def apply_temporal_drift(true_probas: np.ndarray, match_phases: list, current_match_idx: int) -> np.ndarray:
+    """
+    Simule la variation des probabilités réelles via un modèle de 'Drift Relatif'.
+    L'incertitude dépend du nombre de matchs qu'une équipe doit encore jouer 
+    entre le 'current_match_idx' et le match cible.
+    """
+    n_matches = len(true_probas)
+    drifted_probas = np.copy(true_probas)
+    
+    current_phase_str = match_phases[current_match_idx] if current_match_idx < n_matches else "Phase Finale"
+    
+    # Fonction utilitaire pour extraire le "Niveau d'Information"
+    def get_phase_level(p_str):
+        if not isinstance(p_str, str): return 4
+        if "J1" in p_str: return 1
+        if "J2" in p_str: return 2
+        if "J3" in p_str: return 3
+        return 4 # Phases Finales
+        
+    current_level = get_phase_level(current_phase_str)
+    
+    for i in range(n_matches):
+        phase = match_phases[i]
+        
+        # Le passé ou le match du jour est connu avec certitude
+        if i <= current_match_idx:
+            continue
+            
+        target_level = get_phase_level(phase)
+        
+        # Calcul du Delta d'Information (Combien de matchs mystères séparent la cible de notre savoir actuel ?)
+        shocks_remaining = target_level - current_level
+        
+        # --- LOGIQUE DE DRIFT RELATIF ---
+        if target_level == 4:
+            # Phases finales : les forces sont connues par tout le monde. 
+            # Le drift redevient un simple bruit de compétition (ex: fatigue, blessure).
+            std_dev = 0.025
+            
+        elif shocks_remaining <= 0:
+            # On est dans la même phase (ex: on est en J2, on prédit le match de demain qui est aussi en J2)
+            # Les cotes du CSV intègrent déjà le choc précédent. Juste du bruit de fond.
+            std_dev = 0.025 
+            
+        elif shocks_remaining == 1:
+            # 1 match de décalage (ex: On est en J1 et on prédit la J2, ou J2 vers J3)
+            # Il manque l'information d'un match complet.
+            std_dev = 0.035 
+            
+        elif shocks_remaining >= 2:
+            # 2 matchs de décalage (ex: On est en J1 et on regarde jusqu'en J3)
+            # L'incertitude est maximale.
+            std_dev = 0.06 
+            
+        else:
+            std_dev = 0.025 # Fallback de sécurité
+            
+        # Application du drift multiplicatif
+        noise = np.random.normal(1.0, std_dev, 3)
+        drifted_probas[i] = true_probas[i] * noise
+        
+        # Bornes logiques du football
+        drifted_probas[i] = np.clip(drifted_probas[i], MIN_TRUE_PROBA, MAX_TRUE_PROBA)
+        
+        # Normalisation obligatoire (somme = 1)
+        drifted_probas[i] = drifted_probas[i] / np.sum(drifted_probas[i])
+        
+    return drifted_probas
+
+def calculate_mpp_gains(
+    true_probas: np.ndarray, 
+    a=CUBIC_A, b=CUBIC_B, c=CUBIC_C, d=CUBIC_D, 
+    add_noise: bool = False, 
+    rmse: float = RMSE_GAINS  # La valeur issue du Notebook 12
+) -> np.ndarray:
+    """
+    Calcul des gains MPP à partir des vraies probabilités.
+    Utilise le modèle polynomial d'ordre 3 (f(p) = a*p³ + b*p² + c*p + d).
+    
+    Si add_noise=True, injecte l'erreur de prédiction historique (RMSE) des bookmakers.
+    """
+    # 1. Calcul de base du polynôme
+    gains = a * (true_probas**3) + b * (true_probas**2) + c * true_probas + d
+    
+    # 2. Ajout du bruit stochastique si demandé
+    if add_noise:
+        noise = np.random.normal(0, rmse, true_probas.shape)
+        gains += noise
+        
+    # 3. Sécurité des bornes MPP
+    gains = np.clip(gains, MIN_MPP_GAIN, MAX_MPP_GAIN)
+    
+    # 4. Arrondi mathématique correct avant conversion en entier
+    return np.round(gains).astype(int)
+
+# --- FONCTIONS LIÉES AU MODÈLE DE FOULE (CROWD) ---
+def apply_heteroscedastic_noise(crowds, rmse=0.083):
+    """
+    Applique un bruit hétéroscédastique (variance max à 0.5) sur une matrice de probabilités.
+    Accepte un RMSE scalaire (float) ou dynamique (array 2D).
+    """
+    # Le bruit est max à 0.5, et tend vers 0 aux extrémités
+    scale_factor = np.minimum(crowds, 1.0 - crowds)
+    
+    # Normalisation pour que l'amplitude du bruit corresponde au RMSE demandé
+    mean_scale = np.mean(scale_factor) + 1e-9
+    normalized_scale = scale_factor / mean_scale
+    
+    # Tirage du bruit gaussien (rmse s'adaptera que ce soit un float ou un array)
+    noise = np.random.normal(0, 1, crowds.shape) * rmse * normalized_scale
+    
+    noisy_crowds = crowds + noise
+    
+    # Sécurité : on empêche les probabilités de devenir aberrantes
+    noisy_crowds = np.clip(noisy_crowds, 0.005, 0.995)
+    
+    # Renormalisation stricte pour que la somme par ligne fasse toujours 100%
+    noisy_crowds = noisy_crowds / noisy_crowds.sum(axis=1, keepdims=True)
+    
+    return noisy_crowds.astype(np.float32)
+
+def estimate_crowd_3D(p1, pN, p2, beta=CROWD_BETA, eps=CROWD_EPSILON, add_noise=False, rmse=0.083):
+    # 1. Calcul des "utilités" (attractivité brute de chaque issue)
+    u1 = p1 ** beta
+    uN = pN ** beta
+    u2 = p2 ** beta
+    
+    # 2. Somme des utilités pour la normalisation (Softmax)
+    somme_u = u1 + uN + u2
+    
+    # 3. Application de la formule : Plancher + (Reste à distribuer * Part Softmax)
+    c1 = eps + (1.0 - 3.0 * eps) * (u1 / somme_u)
+    cN = eps + (1.0 - 3.0 * eps) * (uN / somme_u)
+    c2 = eps + (1.0 - 3.0 * eps) * (u2 / somme_u)
+    
+    # 4. Injection du Bruit via la fonction centralisée
+    if add_noise:
+        crowds = np.column_stack((np.atleast_1d(c1), np.atleast_1d(cN), np.atleast_1d(c2)))
+        noisy_crowds = apply_heteroscedastic_noise(crowds, rmse=rmse)
+        
+        # Restitution du bon format (scalaire ou tableau)
+        if np.isscalar(p1):
+            return noisy_crowds[0, 0], noisy_crowds[0, 1], noisy_crowds[0, 2]
+        else:
+            return noisy_crowds[:, 0], noisy_crowds[:, 1], noisy_crowds[:, 2]
+            
+    return c1, cN, c2
+
+# Utilisée pour le pronostic des favoris et meilleurs buteurs (notebook 16)
+def generate_drifted_ensemble_crowds(match_du_jour_idx, probas_poules, csv_crowds_poules, n_ensembles=10):
+    n_poules = len(probas_poules)
+    
+    # 1. Calcul des distances et des Alphas (Demi-vie de 4 matchs)
+    dists = np.arange(n_poules) - match_du_jour_idx
+    dists_positive = np.maximum(0, dists)
+    alphas = 0.95 * (0.5 ** (dists_positive / 4.0))
+    alphas_2d = alphas.astype(np.float32)[:, np.newaxis]
+    
+    # 2. Crowd Théorique Pur
+    c1, cN, c2 = estimate_crowd_3D(
+        probas_poules[:, 0], probas_poules[:, 1], probas_poules[:, 2], 
+        add_noise=False
+    )
+    theo_crowds_pure = np.column_stack((c1, cN, c2)).astype(np.float32)
+    
+    # 3. Le Lissage Bayésien
+    blended_mean_crowds = (alphas_2d * csv_crowds_poules) + ((1.0 - alphas_2d) * theo_crowds_pure)
+    
+    # 4. RMSE Dynamique
+    dynamic_rmse = 0.083 * (1.0 - alphas_2d)
+    
+    # 5. Génération du tenseur (N_ensembles, N_poules, 3)
+    ensemble_crowds = np.zeros((n_ensembles, n_poules, 3), dtype=np.float32)
+    for e in range(n_ensembles):
+        ensemble_crowds[e] = apply_heteroscedastic_noise(blended_mean_crowds, rmse=dynamic_rmse)
+        
+    return ensemble_crowds

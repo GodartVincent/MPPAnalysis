@@ -11,10 +11,10 @@ from mpp_project.mpp_env import MppEnv
 
 # Define Absolute Paths
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) 
-ROOT_DIR = os.path.dirname(SCRIPT_DIR)
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(ROOT_DIR, "log")
-MODELS_DIR = os.path.join(ROOT_DIR, "models_v3")
-TENSORBOARD_LOG_DIR = os.path.join(LOG_DIR, "ppo_mpp_tensorboard_v3")
+MODELS_DIR = os.path.join(ROOT_DIR, "models_v4")
+TENSORBOARD_LOG_DIR = os.path.join(LOG_DIR, "ppo_mpp_tensorboard_v4")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 # Define model paths
@@ -22,10 +22,11 @@ PHASE1_MODEL_PATH = os.path.join(MODELS_DIR, "ppo_v3_phase1_deterministic_final.
 PHASE2_MODEL_PATH = os.path.join(MODELS_DIR, "ppo_v3_phase2_mixed_opps_final.zip")
 PHASE3_MODEL_PATH = os.path.join(MODELS_DIR, "ppo_v3_phase3_full_rand_opps_final.zip")
 PHASE4_MODEL_PATH = os.path.join(MODELS_DIR, "ppo_v3_phase4_domain_rand_final.zip")
+V4_MODEL_PATH     = os.path.join(MODELS_DIR, "ppo_v4_104_match_adaptive_drift.zip")
 
 # Default Simulation Configuration
 match_params = {
-    'n_matches': 51,
+    'n_matches': 104,
     'ev_avg': 35,
     'draw_fact_min': 0.2,
     'draw_fact_max': 0.75,
@@ -34,7 +35,7 @@ match_params = {
     'proba_fact_std': 0.2 # Since v2 seemed to rely on gain to estimate probas, we decorrelate them more
 }
 N_PLAYERS = 12
-N_MATCHES = 51
+N_MATCHES = 104
 
 # Hyperparameters
 policy_kwargs = dict(net_arch=dict(pi=[256, 256], vf=[256, 256]))
@@ -74,11 +75,21 @@ PHASE4_HYPERPARAMS = {
     "policy_kwargs": policy_kwargs,
     "ent_coef": 0.005        # Reduced entropy: Find the exploit and stick to it
 }
+V4_HYPERPARAMS = {
+    "n_steps": 4160,         # ~64 000 transitions totales par update
+    "batch_size": 1040,      # Mini-batches de 10 tournois pour la descente de gradient
+    "learning_rate": 3e-5,   # Reincrease learning rate since we are starting from a good model and want to adapt faster to the new format
+    "gamma": 1.0,            # Long-term horizon
+    "gae_lambda": 0.95,      # Smoothing
+    "vf_coef": 1.0,          # Value function is critical here
+    "ent_coef": 0.015        # Increased entropy: With the new format and more matches, we can afford more exploration to find new strategies
+}
 
 PHASE1_STEPS = 2_000_000
 PHASE2_STEPS = 6_000_000
 PHASE3_STEPS = 9_000_000
 PHASE4_STEPS = 13_000_000
+V4_STEPS     = 6_000_000
 
 # Helper for Callbacks
 def get_callbacks(phase_name, eval_env):
@@ -261,6 +272,47 @@ def run_training_curriculum():
             model.save(os.path.join(MODELS_DIR, "model_INTERRUPTED.zip"))
             print("Saved backup.")
 
+
+def run_v4_world_cup_training():
+    
+    try:
+        # --- PHASE 1: Deterministic Warmup ---
+        if not os.path.exists(V4_MODEL_PATH):
+            print("--- STARTING V4 : WORLD CUP FORMAT (104 MATCHES, ADAPTIVE DRIFT) ---")
+            
+            # 1. Environnement avec 104 matchs
+            env_v4 = MppEnv(n_players=N_PLAYERS, n_matches=N_MATCHES, match_params=match_params,
+                                        num_random_opponents=11,
+                                        use_advanced_opponents=True,
+                                        use_domain_randomization=False,
+                                        use_winner_reward=True)
+                    
+            eval_v4 = Monitor(MppEnv(n_players=N_PLAYERS, n_matches=N_MATCHES, match_params=match_params,
+                                num_random_opponents=11, 
+                                use_advanced_opponents=True,
+                                use_domain_randomization=False,
+                                use_winner_reward=True))
+            
+            
+            # Load Previous Model: best of phase 4 of v3
+            prev_model = PHASE4_MODEL_PATH
+
+            model = PPO.load(prev_model, env=env_v4, **V4_HYPERPARAMS)
+            model.set_logger(create_logger("v4_104Matches_AdaptiveDrift"))
+            
+            model.learn(total_timesteps=V4_STEPS, progress_bar=True, reset_num_timesteps=False,
+                        callback=get_callbacks("v4", eval_v4))
+            model.save(V4_MODEL_PATH)
+            print(f"--- Version 4 Complete ---")
+        else:
+            print(f"--- SKIPPING Version 4 (Found) ---")
+            
+    except KeyboardInterrupt:
+        print("\n\nINTERRUPTED BY USER (Ctrl+C)")
+        if 'model' in locals():
+            model.save(os.path.join(MODELS_DIR, "model_INTERRUPTED.zip"))
+            print("Saved backup.")
+
 # Run the script
 if __name__ == "__main__":
-    run_training_curriculum()
+    run_v4_world_cup_training()

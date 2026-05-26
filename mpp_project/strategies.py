@@ -15,18 +15,21 @@ ROOT_DIR = os.path.dirname(CURRENT_DIR)
 MODELS_V1_DIR = os.path.join(ROOT_DIR, "models")
 MODELS_V2_DIR = os.path.join(ROOT_DIR, "models_v2")
 MODELS_V3_DIR = os.path.join(ROOT_DIR, "models_v3")
+MODELS_V4_DIR = os.path.join(ROOT_DIR, "models_v4")
 
 # Model Caching
 _LOADED_MODELS = {}
 
-def get_model(model_path, version="v3"):
+def get_model(model_path, version="v4"):
     """Loads a model to avoid reloading it 5000 times."""
     global _LOADED_MODELS
     
     # Resolve path
     if not os.path.isabs(model_path):
         # Try finding it in known dirs
-        if version == "v3":
+        if version == "v4":
+            model_path = os.path.join(MODELS_V4_DIR, model_path)
+        elif version == "v3":
             model_path = os.path.join(MODELS_V3_DIR, model_path)
         elif version == "v2":
             model_path = os.path.join(MODELS_V2_DIR, model_path)
@@ -61,7 +64,7 @@ def _get_legacy_obs_v1(match_probas, match_gains, opp_repartition, player_scores
 def _get_modern_obs(match_probas, match_gains, opp_repartition, player_scores, my_idx, **kwargs):
     """V3 Core Builder (25 features)."""
     ev_avg = kwargs.get('ev_avg', 35.0)
-    total_matches = kwargs.get('n_matches', 51)
+    total_matches = kwargs.get('n_matches', 104)
 
     max_points_per_match = np.max(match_gains, axis=1)
     future_max_points = np.sum(max_points_per_match)
@@ -85,13 +88,13 @@ def _get_modern_obs(match_probas, match_gains, opp_repartition, player_scores, m
 # 2. STRATEGY FACTORY
 # ==========================================
 
-def create_strategy_from_model(model_filename, version="v3", name=None):
+def create_strategy_from_model(model_filename, version="v4", name=None):
     """
     Creates a strategy function from a model file.
     
     Args:
         model_filename (str): Path or filename of the zip model.
-        version (str): 'v1', 'v2', or 'v3' to determine observation format.
+        version (str): 'v1', 'v2', 'v3', or 'v4' to determine observation format.
         name (str): Optional custom name for the strategy.
     """
     
@@ -117,6 +120,12 @@ def create_strategy_from_model(model_filename, version="v3", name=None):
             obs, sort_idx = _get_modern_obs(match_probas, match_gains, opp_repartition, player_scores, my_idx, **kwargs)
             action, _ = model.predict(obs, deterministic=True)
             return int(sort_idx[action])
+        
+        # V4 (104 match World Cup - 25 features)
+        elif version == "v4":
+            obs, sort_idx = _get_modern_obs(match_probas, match_gains, opp_repartition, player_scores, my_idx, **kwargs)
+            action, _ = model.predict(obs, deterministic=True)
+            return int(sort_idx[action])
             
         else:
             raise ValueError(f"Unknown agent version: {version}")
@@ -133,6 +142,21 @@ def strat_typical_opponent(match_probas, match_gains, opp_repartition, player_sc
     """Random bet following opp_repartition."""
     # Slice [0] to use current match
     return np.random.choice([0, 1, 2], p=opp_repartition[0])
+
+def strat_noisy_typical_opponent(match_probas, match_gains, opp_repartition, player_scores, my_idx, matches_remaining=25, **kwargs):
+    """
+    mpp_probas: Les probas implicites tirées des cotes de l'application (ex: [0.70, 0.20, 0.10])
+    """
+    # 1. Ajout de bruit stochastique (Loi de Dirichlet) a opp_repartition
+    # Les 'alphas' concentrent la distribution autour de base_repartition
+    noise_level = 40.0
+    alphas = opp_repartition * noise_level
+    
+    # Tirage au sort de la vraie répartition de ce match
+    noisy_repartition = np.array([
+        np.random.dirichlet(alphas) for alphas in alphas
+    ])
+    return noisy_repartition
 
 def strat_random(match_probas, match_gains, opp_repartition, player_scores, my_idx, matches_remaining=25, **kwargs):
     """Bet randomly."""
@@ -229,6 +253,7 @@ strat_v3_p1 = create_strategy_from_model("ppo_v3_phase1_deterministic.zip", "v3"
 strat_v3_p2 = create_strategy_from_model("ppo_v3_phase2_mixed_opps.zip", "v3", "V3 P2 (Mixed)")
 strat_v3_p3 = create_strategy_from_model("ppo_v3_phase3_full_rand_opps.zip", "v3", "V3 P3 (FullRand)")
 strat_v3_p4 = create_strategy_from_model("ppo_v3_phase4_domain_rand.zip", "v3", "V3 P4 (DomRand)")
+strat_v4_p5 = create_strategy_from_model("ppo_v4_104_match_adaptive_drift.zip", "v4", "V4 P5 (104 + adaptive drift + SymLog)")
 
 # ==========================================
 # 5. EXPORT LISTS
@@ -236,6 +261,7 @@ strat_v3_p4 = create_strategy_from_model("ppo_v3_phase4_domain_rand.zip", "v3", 
 
 STRATEGY_FUNCTIONS = [
     strat_typical_opponent,
+    strat_noisy_typical_opponent,
     strat_random,
     strat_best_ev,
     strat_best_simple_rel_ev,
@@ -246,22 +272,24 @@ STRATEGY_FUNCTIONS = [
     strat_adaptive_simple_ev,
     strat_highest_variance,
     # V1 Agent
-    strat_v1_legacy,
+    #strat_v1_legacy,
     # V2 Agents
-    strat_v2_p1,
-    strat_v2_p2,
-    strat_v2_p3,
-    strat_v2_p4,
-    strat_v2_p5,
+    #strat_v2_p1,
+    #strat_v2_p2,
+    #strat_v2_p3,
+    #strat_v2_p4,
+    #strat_v2_p5,
     # V3 Agents
     strat_v3_p1,
     strat_v3_p2,
     strat_v3_p3,
-    strat_v3_p4
+    strat_v3_p4,
+    strat_v4_p5
 ]
 
 STRATEGY_NAMES = [
     "Typical Opponent",
+    "Noisy Typical Opponent",
     "Random",
     "Best Simple EV",
     "Best Simple Relative EV",
@@ -271,14 +299,15 @@ STRATEGY_NAMES = [
     "Safe Simple EV",
     "Adaptive Simple EV",
     "Highest Variance",
-    "RL Legacy (V1 - 4M)",
-    "RL V2 (P1 - PPO)",
-    "RL V2 (P2 - Mixed)",
-    "RL V2 (P3 - MoreRand)",
-    "RL V2 (P4 - FullRand)",
-    "RL V2 (P5 - DomainRnd)",
+    #"RL Legacy (V1 - 4M)",
+    #"RL V2 (P1 - PPO)",
+    #"RL V2 (P2 - Mixed)",
+    #"RL V2 (P3 - MoreRand)",
+    #"RL V2 (P4 - FullRand)",
+    #"RL V2 (P5 - DomainRnd)",
     "RL V3 (P1 - PPO)",
     "RL V3 (P2 - Mixed)",
     "RL V3 (P3 - FullRand)",
-    "RL V3 (P4 - DomainRnd)"
+    "RL V3 (P4 - DomainRnd)",
+    "RL V4 (P5 - 104 + SymLog)"
 ]

@@ -5,7 +5,7 @@ from typing import List, Callable, Dict
 
 # Strategies
 from .strategies import (
-    strat_typical_opponent, strat_best_ev, strat_highest_variance, 
+    strat_noisy_typical_opponent, strat_best_ev, strat_highest_variance, 
     strat_favorite, strat_adaptive_simple_ev, 
     strat_safe_simple_ev
 )
@@ -25,7 +25,7 @@ class MppEnv(gym.Env):
 
     def __init__(self, 
                  n_players: int = 12,  # Max size for player_scores in observation
-                 n_matches: int = 51, 
+                 n_matches: int = 104, 
                  match_params: Dict = None,
                  # --- Curriculum Arguments ---
                  num_random_opponents: int = 0,
@@ -78,10 +78,10 @@ class MppEnv(gym.Env):
     def _init_strategy_pool(self, use_advanced):
         """Initialize the pool of potential opponent strategies."""
         if use_advanced:
-            self.strat_pool_random = [strat_typical_opponent]
+            self.strat_pool_random = [strat_noisy_typical_opponent]
             self.strat_pool_elite = [strat_adaptive_simple_ev, strat_safe_simple_ev, strat_best_ev]
         else:
-            self.strat_pool_random = [strat_typical_opponent]
+            self.strat_pool_random = [strat_noisy_typical_opponent]
             self.strat_pool_elite = [strat_best_ev, strat_highest_variance, strat_favorite]
 
     def _generate_tournament(self):
@@ -224,82 +224,117 @@ class MppEnv(gym.Env):
         """
         The agent takes an 'action'.
         The environment simulates one match and returns the result.
+        Uses Expected Reward (SymLog) combined with physical state transitions.
         """
+        # --- 1. State Extraction & Setup ---
+        
+        # Fixed temperature to define the scale of the points
+        # E.g., if ev_avg is 35, T_base = 105. Gaps around 100 points are highly sensitive.
+        T_base = 3.0 * self.match_params['ev_avg']
+        
+        def get_symlog_potential(gap, temp):
+            # np.log1p(x) calculates ln(1 + x) with high numerical stability
+            return np.sign(gap) * np.log1p(np.abs(gap / temp))
+
         m_probas = self.outcome_probas[self.current_match_idx]
         m_gains = self.match_gains[self.current_match_idx]
         
-        # Simulate the match
-        true_outcome = np.random.choice([0, 1, 2], p=m_probas)
-        
         # Map Agent Action
-        # Reconstruct the sort order to know what the agent picked
+        # Reconstruct the sort order to know what the agent picked (invariant input)
         sort_idx = np.argsort(m_probas)[::-1]
         agent_bet = sort_idx[action]
         
-        # Capture State before Update
+        # Capture current score state
         previous_scores = np.copy(self.player_scores)
+        agent_score_prev = previous_scores[self.agent_idx]
         
-        # Update Agent
-        if agent_bet == true_outcome:
-            self.player_scores[self.agent_idx] += m_gains[true_outcome]
-            
-        # Update Opponents
-        for i, strat_func in enumerate(self.active_opponent_strats):
-            p_idx = i + 1
-            bet = strat_func(
+        opp_scores_prev = np.delete(previous_scores, self.agent_idx)
+        leader_score_prev = np.max(opp_scores_prev)
+        
+        # --- 2. Determine Opponents' Bets Early ---
+        # We query the opponents' strategies once and store their bets.
+        opponents_bets = np.array([
+            strat_func(
                 match_probas=self.outcome_probas[self.current_match_idx:], 
                 match_gains=self.match_gains[self.current_match_idx:], 
                 opp_repartition=self.opp_repartition[self.current_match_idx:], 
-                player_scores=self.player_scores, 
-                my_idx=p_idx, 
+                player_scores=previous_scores, 
+                my_idx=i + 1, 
                 matches_remaining=self.n_matches - self.current_match_idx,
                 ev_avg=self.match_params['ev_avg'],
                 n_matches=self.n_matches
-            )
-            if bet == true_outcome:
-                self.player_scores[p_idx] += m_gains[true_outcome]
+            ) for i, strat_func in enumerate(self.active_opponent_strats)
+        ], dtype=np.int32)
 
-        # Reward (Affine Decay)
-        opp_scores_prev = np.delete(previous_scores, self.agent_idx)
-        leader_score_prev = np.max(opp_scores_prev)
-        agent_score_prev = previous_scores[self.agent_idx]
+        # --- 3. Calculate Expected Reward (Rao-Blackwellization / SymLog) ---
+        if self.use_winner_reward:
+            # Calculate the agent's potential BEFORE the match
+            phi_prev = get_symlog_potential(agent_score_prev - leader_score_prev, T_base)
+            expected_phi_new = 0.0
 
-        opp_scores_new = np.delete(self.player_scores, self.agent_idx)
-        leader_score_new = np.max(opp_scores_new)
-        agent_score_new = self.player_scores[self.agent_idx]
+            # Loop over the 3 possible match outcomes (0, 1, 2)
+            for possible_outcome in [0, 1, 2]:
+                p_outcome = m_probas[possible_outcome]
+                
+                # A. Hypothetical Agent Score projection
+                hypothetical_agent_score = agent_score_prev
+                if agent_bet == possible_outcome:
+                    hypothetical_agent_score += m_gains[possible_outcome]
+                    
+                # B. Hypothetical Opponents' Scores projection
+                hypothetical_opp_scores = np.copy(opp_scores_prev)
+                
+                # We create a boolean mask where bets match the outcome, 
+                # and add the gains only to those specific indices.
+                mask = (opponents_bets == possible_outcome)
+                hypothetical_opp_scores[mask] += m_gains[possible_outcome]
+                        
+                hypothetical_leader_score = np.max(hypothetical_opp_scores)
+                
+                # C. Calculate the potential for this specific hypothetical scenario
+                hypothetical_phi_new = get_symlog_potential(
+                    hypothetical_agent_score - hypothetical_leader_score, 
+                    T_base
+                )
+                
+                # Weight by the true probability of the outcome
+                expected_phi_new += p_outcome * hypothetical_phi_new
 
+            # The Dense Reward is given purely based on Mathematical Expectation
+            reward = (expected_phi_new - phi_prev) * 10.0
+            
+        else:
+            # Fallback for Legacy dense reward (not evaluated here, see section 4)
+            reward = 0.0
+
+        # --- 4. The True Physics of the Game (State Transition) ---
+        
+        # We draw the TRUE result to advance the state of the environment
+        true_outcome = np.random.choice([0, 1, 2], p=m_probas)
+
+        # Update Agent's actual score
+        if agent_bet == true_outcome:
+            self.player_scores[self.agent_idx] += m_gains[true_outcome]
+            
+        # Update Opponents' actual scores using the bets we already computed
+        mask = (opponents_bets == true_outcome)
+        self.player_scores[1:][mask] += m_gains[true_outcome]
+
+        # Handle Legacy reward calculation if use_winner_reward is False
         if not self.use_winner_reward:
-             # Legacy Dense Reward
+            agent_score_new = self.player_scores[self.agent_idx]
+            opp_scores_new = np.delete(self.player_scores, self.agent_idx)
+            leader_score_new = np.max(opp_scores_new)
             gap_change = (agent_score_new - leader_score_new) - (agent_score_prev - leader_score_prev)
             reward = np.sign(gap_change)
-        else:
-            # Adaptive Temperature Tanh Reward
-            # Dynamic Base Temperature: Scales with this tournament's ev_avg
-            T_base = 3.0 * self.match_params['ev_avg']
-            
-            matches_rem_prev = self.n_matches - self.current_match_idx
-            matches_rem_new = matches_rem_prev - 1
-            
-            # Formula: T = T_base * (0.2 + 0.8 * (Rem/Total))
-            decay_prev = 0.2 + 0.8 * (matches_rem_prev / self.n_matches)
-            T_prev = max(0.1, T_base * decay_prev)
-            
-            decay_new = 0.2 + 0.8 * (matches_rem_new / self.n_matches)
-            T_new = max(0.1, T_base * decay_new)
 
-            def get_potential(gap, temp): 
-                return np.tanh(gap / temp)
-            
-            phi_prev = get_potential(agent_score_prev - leader_score_prev, T_prev)
-            phi_new  = get_potential(agent_score_new - leader_score_new, T_new)
-            
-            reward = (phi_new - phi_prev) * 10.0
-
+        # --- 5. Episode Completion & Terminal Bonus ---
+        
         self.current_match_idx += 1
         done = (self.current_match_idx >= self.n_matches)
         
         if done:
-            # Terminal Win Bonus
+            # Terminal Win Bonus (Calculated using the ACTUAL finalized scores)
             if np.argmax(self.player_scores) == self.agent_idx:
                 reward += 10.0
         

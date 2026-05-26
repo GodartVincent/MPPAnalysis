@@ -6,6 +6,8 @@ for the MPP simulation.
 import numpy as np
 import random
 
+from mpp_project.core import MAX_TRUE_PROBA, MIN_TRUE_PROBA
+
 def generate_outcome_probas(
     n_matches: int, 
     draw_fact_min: float = 0.2,
@@ -69,14 +71,39 @@ def generate_gains(outcome_probas: np.ndarray, ev_ref: float = 35.0, p_rand_fact
     Returns:
         A (n_matches, 3) numpy array of MPP points for each outcome.
     """
-    # Introduce small noise to simulate MPP's earlier probability estimates
-    mpp_probas = outcome_probas * np.random.normal(1, p_rand_fact_std, outcome_probas.shape)
-    mpp_probas[mpp_probas <= 0] = 1e-6  # Prevent negative or zero probas
-    mpp_probas = mpp_probas / mpp_probas.sum(axis=1)[:, np.newaxis]  # Re-normalize
+    n_matches = outcome_probas.shape[0]
+    std_array = np.zeros(n_matches)
+    
+    # Définition des indices pour garantir des dimensions parfaites
+    idx1 = int(24 * n_matches / 104)
+    idx2 = int(48 * n_matches / 104)
+    idx3 = int(72 * n_matches / 104)
+    
+    # 1. Journée 1 : Drift initial
+    std_array[0:idx1] = np.linspace(0.05, 0.09, idx1)
+    
+    # 2. Journée 2 : Petit gap, puis drift
+    std_array[idx1:idx2] = np.linspace(0.115, 0.155, idx2 - idx1)
+    
+    # 3. Journée 3 : Gros gap (enjeux), drift fort
+    std_array[idx2:idx3] = np.linspace(0.18, 0.22, idx3 - idx2)
+    
+    # 4. Phases finales : Marché efficient
+    std_array[idx3:n_matches] = 0.05
+
+    # L'ajout de [:, np.newaxis] permet de diffuser (broadcast) le std sur les 3 colonnes de chaque match
+    mpp_probas = outcome_probas * np.random.normal(1, std_array[:, np.newaxis], outcome_probas.shape)
+    
+    # Borner les probabilités à des valeurs réalistes pour le football
+    mpp_probas = np.clip(mpp_probas, MIN_TRUE_PROBA, MAX_TRUE_PROBA)
+    
+    # Renormalisation pour que la somme des probabilités de chaque match soit égale à 1
+    mpp_probas = mpp_probas / mpp_probas.sum(axis=1)[:, np.newaxis] 
     
     ev_factor = -2.54 * np.power(mpp_probas, 2) + 3.14 * mpp_probas + 0.21
     ev = ev_factor * ev_ref
-    gains = ev/mpp_probas
+    gains = ev / mpp_probas
+    
     return gains.astype(int)
 
 def generate_opponent_repartition(outcome_probas, gamma=2.0):
