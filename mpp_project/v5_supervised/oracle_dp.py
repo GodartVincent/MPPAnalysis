@@ -17,6 +17,7 @@ GAP_MAX = 400
 GAP_OFFSET = -GAP_MIN  # 600
 GRID_SIZE = GAP_MAX - GAP_MIN + 1  # 1001
 
+N_ACTIONS = 3
 N_PLAYERS = 12
 N_SIMULATIONS = 2000 # Nombre de phases finales à simuler
 
@@ -30,6 +31,36 @@ match_params = {
     'proba_fact_std': 0.025
 }
 
+@njit
+def compute_alphas_isolement(true_probas, crowds, gains_1N2, seuil_isolement=120.0):
+    """
+    Calcule le facteur d'isolement (alpha) de 0.0 (Début/Meute dense) à 1.0 (Fin/Joueurs isolés)
+    basé sur l'écart-type cumulé réel des gains.
+    """
+    n_matches = true_probas.shape[0]
+    alphas = np.zeros(n_matches, dtype=np.float32)
+    variance_cumulee = 0.0
+    
+    for t in range(n_matches):
+        E_X = 0.0
+        E_X2 = 0.0
+        for out in range(3):
+            # Probabilité conjointe que l'issue se réalise ET qu'un joueur l'ait pronostiquée
+            p_gain = true_probas[t, out] * crowds[t, out]
+            gain = gains_1N2[t, out]
+            
+            E_X += p_gain * gain
+            E_X2 += p_gain * (gain ** 2)
+            
+        var_t = E_X2 - (E_X ** 2)
+        variance_cumulee += var_t
+        
+        sigma_t = np.sqrt(variance_cumulee)
+        
+        # Gating par saturation (Michaelis-Menten)
+        alphas[t] = sigma_t / (sigma_t + seuil_isolement)
+        
+    return alphas
 
 def generate_tournament_environment(env_config=None):
     """
@@ -492,28 +523,36 @@ def generate_knockout_data():
 
 # Utilisé pour pronostiquer le meilleur buteur et le favori (notebook 16)
 @njit(parallel=True)
-def backpropagate_group_stages_stochastic(match_du_jour_idx, probas_poules, gains_poules, ensemble_crowds, V_phases_finales):
-    """
-    Rétropropage la DP en intégrant l'incertitude temporelle de la foule.
-    ensemble_crowds : Tenseur de forme (N_ensembles, N_poules, 3)
-    """
+def backpropagate_group_stages_stochastic(match_du_jour_idx, probas_poules, gains_poules, ensemble_crowds, V_phases_finales, p_empirique_3D):
+    
     V_next = np.copy(V_phases_finales)
     
     N_POULES = len(probas_poules)
     N_ENS = ensemble_crowds.shape[0]
+    max_gain = p_empirique_3D.shape[2]
     
-    # On recule jusqu'au match du jour (inutile de calculer le passé)
+    # Pré-calcul de la foule moyenne pour la vitesse
+    mean_crowds = np.zeros((N_POULES, 3), dtype=np.float32)
+    for t in range(N_POULES):
+        for out in range(3):
+            sum_c = 0.0
+            for e in range(N_ENS):
+                sum_c += ensemble_crowds[e, t, out]
+            mean_crowds[t, out] = sum_c / N_ENS
+    
+    # On recule jusqu'au match du jour
     for t in range(N_POULES - 1, match_du_jour_idx - 1, -1):
         V_current = np.zeros((GRID_SIZE, GRID_SIZE, 2), dtype=np.float32)
         
-        time_fraction = 1.0 - (t / N_MATCHES)
-        N_eff = 1.0 + (N_PLAYERS - 3.0) * (time_fraction ** 5.50)
-        
         t_prob = probas_poules[t]
         t_gain = gains_poules[t]
+        t_p_empirique = p_empirique_3D[t]
+        c_rep = mean_crowds[t] 
         
         for g1 in prange(GRID_SIZE):
             val_g1 = g1 - GAP_OFFSET
+            # 🚀 OPTIMISATION RESTAURÉE : Grâce au tri, g1 est toujours <= g2. 
+            # On ne calcule que le triangle supérieur !
             for g2 in range(g1, GRID_SIZE):
                 val_g2 = g2 - GAP_OFFSET
                 
@@ -521,75 +560,67 @@ def backpropagate_group_stages_stochastic(match_du_jour_idx, probas_poules, gain
                 best_v_b1 = 0.0
                 
                 for a in range(3):
-                    # Les accumulateurs moyennés sur les N_ENS univers de foule
-                    sum_expected_v_b0 = 0.0
-                    sum_expected_v_keep = 0.0
-                    sum_expected_v_use = 0.0
+                    expected_v_b0 = 0.0
+                    expected_v_keep = 0.0
+                    expected_v_use = 0.0
                     
-                    # --- LA BOUCLE MONTE CARLO EST ICI (Très rapide en C++) ---
-                    for e in range(N_ENS):
-                        c_rep = ensemble_crowds[e, t]
-                        
-                        expected_v_b0_e = 0.0
-                        expected_v_keep_e = 0.0
-                        expected_v_use_e = 0.0
-                        
-                        for out in range(3):
-                            p_out = t_prob[out]
-                            gain_val = int(t_gain[out])
+                    for out in range(3):
+                        p_out = t_prob[out]
+                        if p_out == 0.0: continue
                             
-                            a_g = gain_val if a == out else 0
-                            a_g_boost = (gain_val * 2) if a == out else 0
-                            
-                            prob_pack_hits = 1.0 - (1.0 - c_rep[out]) ** N_eff
-                            
-                            for bob_action in range(3):
-                                p_bob = c_rep[bob_action]
-                                bob_g = gain_val if bob_action == out else 0
-                                pack_g_hit = gain_val
-                                pack_g_miss = 0
-                                
-                                # HIT
-                                jp_hit = p_out * p_bob * prob_pack_hits
-                                ng_min_norm = max(-600, min(400, min(val_g1 + a_g - bob_g, val_g2 + a_g - pack_g_hit)))
-                                ng_max_norm = max(-600, min(400, max(val_g1 + a_g - bob_g, val_g2 + a_g - pack_g_hit)))
-                                ng_min_boost = max(-600, min(400, min(val_g1 + a_g_boost - bob_g, val_g2 + a_g_boost - pack_g_hit)))
-                                ng_max_boost = max(-600, min(400, max(val_g1 + a_g_boost - bob_g, val_g2 + a_g_boost - pack_g_hit)))
-                                
-                                expected_v_b0_e   += jp_hit * V_next[ng_min_norm + GAP_OFFSET, ng_max_norm + GAP_OFFSET, 0]
-                                expected_v_keep_e += jp_hit * V_next[ng_min_norm + GAP_OFFSET, ng_max_norm + GAP_OFFSET, 1]
-                                expected_v_use_e  += jp_hit * V_next[ng_min_boost + GAP_OFFSET, ng_max_boost + GAP_OFFSET, 0]
-                                
-                                # MISS
-                                jp_miss = p_out * p_bob * (1.0 - prob_pack_hits)
-                                ng_min_norm_m = max(-600, min(400, min(val_g1 + a_g - bob_g, val_g2 + a_g - pack_g_miss)))
-                                ng_max_norm_m = max(-600, min(400, max(val_g1 + a_g - bob_g, val_g2 + a_g - pack_g_miss)))
-                                ng_min_boost_m = max(-600, min(400, min(val_g1 + a_g_boost - bob_g, val_g2 + a_g_boost - pack_g_miss)))
-                                ng_max_boost_m = max(-600, min(400, max(val_g1 + a_g_boost - bob_g, val_g2 + a_g_boost - pack_g_miss)))
-                                
-                                expected_v_b0_e   += jp_miss * V_next[ng_min_norm_m + GAP_OFFSET, ng_max_norm_m + GAP_OFFSET, 0]
-                                expected_v_keep_e += jp_miss * V_next[ng_min_norm_m + GAP_OFFSET, ng_max_norm_m + GAP_OFFSET, 1]
-                                expected_v_use_e  += jp_miss * V_next[ng_min_boost_m + GAP_OFFSET, ng_max_boost_m + GAP_OFFSET, 0]
+                        a_g = t_gain[out] if a == out else 0
+                        a_g_boost = (t_gain[out] * 2) if a == out else 0
+                        true_gain = t_gain[out]
+                        out_p_empirique = t_p_empirique[out]
                         
-                        sum_expected_v_b0 += expected_v_b0_e
-                        sum_expected_v_keep += expected_v_keep_e
-                        sum_expected_v_use += expected_v_use_e
-                        
-                    # L'espérance réelle : la moyenne sur les N_ENS univers
-                    avg_v_b0 = sum_expected_v_b0 / N_ENS
-                    avg_v_keep = sum_expected_v_keep / N_ENS
-                    avg_v_use = sum_expected_v_use / N_ENS
+                        for bob_a in range(3):
+                            p_bob = c_rep[bob_a]
+                            if p_bob == 0.0: continue
+                                
+                            bob_g = true_gain if bob_a == out else 0
+                            jp_base = p_out * p_bob
+                            
+                            new_gap_bob_norm = val_g1 + a_g - bob_g
+                            new_gap_bob_boost = val_g1 + a_g_boost - bob_g
+                            
+                            esp_peloton_b0 = 0.0
+                            esp_peloton_keep = 0.0
+                            esp_peloton_use = 0.0
+                            
+                            # BOUCLE HISTOGRAMME
+                            for delta_gain in range(max_gain):
+                                p_peloton = out_p_empirique[delta_gain]
+                                if p_peloton == 0.0: continue
+                                    
+                                new_gap_peloton_norm = val_g2 + a_g - delta_gain
+                                new_gap_peloton_boost = val_g2 + a_g_boost - delta_gain
+                                
+                                # 🚀 RESTAURATION DE TA LOGIQUE (LE NOUVEAU BOB)
+                                g1_norm = max(GAP_MIN, min(GAP_MAX, min(new_gap_bob_norm, new_gap_peloton_norm))) + GAP_OFFSET
+                                g2_norm = max(GAP_MIN, min(GAP_MAX, max(new_gap_bob_norm, new_gap_peloton_norm))) + GAP_OFFSET
+                                
+                                g1_boost = max(GAP_MIN, min(GAP_MAX, min(new_gap_bob_boost, new_gap_peloton_boost))) + GAP_OFFSET
+                                g2_boost = max(GAP_MIN, min(GAP_MAX, max(new_gap_bob_boost, new_gap_peloton_boost))) + GAP_OFFSET
+                                
+                                esp_peloton_b0 += p_peloton * V_next[g1_norm, g2_norm, 0]
+                                esp_peloton_keep += p_peloton * V_next[g1_norm, g2_norm, 1]
+                                esp_peloton_use += p_peloton * V_next[g1_boost, g2_boost, 0]
+                                
+                            expected_v_b0 += jp_base * esp_peloton_b0
+                            expected_v_keep += jp_base * esp_peloton_keep
+                            expected_v_use += jp_base * esp_peloton_use
                     
-                    if avg_v_b0 > best_v_b0:
-                        best_v_b0 = avg_v_b0
+                    if expected_v_b0 > best_v_b0:
+                        best_v_b0 = expected_v_b0
                         
-                    best_action_b1 = max(avg_v_keep, avg_v_use)
+                    best_action_b1 = max(expected_v_keep, expected_v_use)
                     if best_action_b1 > best_v_b1:
                         best_v_b1 = best_action_b1
                         
                 V_current[g1, g2, 0] = best_v_b0
                 V_current[g1, g2, 1] = best_v_b1
                 
+        # Symétrie pour l'autre moitié de la grille
         for g1 in prange(GRID_SIZE):
             for g2 in range(g1 + 1, GRID_SIZE):
                 V_current[g2, g1, 0] = V_current[g1, g2, 0]
@@ -598,6 +629,281 @@ def backpropagate_group_stages_stochastic(match_du_jour_idx, probas_poules, gain
         V_next = V_current
         
     return V_current
+
+@njit
+def extract_peloton_full_distribution(true_probas_3d, crowds_3d, gains_1N2, max_gain=250, n_runs=1000000, n_players=11):
+    n_universes = true_probas_3d.shape[0]
+    n_matches = true_probas_3d.shape[1]
+    
+    counts = np.zeros((n_matches, 3, max_gain), dtype=np.float64)
+    occurrences = np.zeros((n_matches, 3), dtype=np.float64)
+    
+    for run in range(n_runs):
+        scores = np.zeros(n_players, dtype=np.int32)
+        u = run % n_universes
+        
+        for t in range(n_matches):
+            
+            # 1. Identification de l'actuel 1er (Futur Bob)
+            best_score = -1
+            bob_idx = 0
+            for i in range(n_players):
+                if scores[i] > best_score:
+                    best_score = scores[i]
+                    bob_idx = i
+                    
+            # 2. Récupération des points du meilleur PARMI LES AUTRES (prev_second_best)
+            prev_second_best = -1
+            for i in range(n_players):
+                if i == bob_idx: # On exclut Bob
+                    continue
+                if scores[i] > prev_second_best:
+                    prev_second_best = scores[i]
+            if prev_second_best == -1: prev_second_best = 0
+                    
+            # 3. Tirage de la réalité du match
+            r_true = np.random.rand()
+            if r_true < true_probas_3d[u, t, 0]: true_out = 0
+            elif r_true < true_probas_3d[u, t, 0] + true_probas_3d[u, t, 1]: true_out = 1
+            else: true_out = 2
+            
+            true_gain_mpp = gains_1N2[t, true_out]
+            
+            # 4. Pronostics et mise à jour des points de TOUS les adversaires
+            for i in range(n_players):
+                r_bet = np.random.rand()
+                if r_bet < crowds_3d[u, t, 0]: bet = 0
+                elif r_bet < crowds_3d[u, t, 0] + crowds_3d[u, t, 1]: bet = 1
+                else: bet = 2
+                
+                if bet == true_out:
+                    scores[i] += true_gain_mpp
+                    
+            # 5. Récupération des points du meilleur HORS ANCIEN BOB (new_second_best)
+            new_second_best = -1
+            for i in range(n_players):
+                if i == bob_idx: # On exclut l'ancien Bob
+                    continue
+                if scores[i] > new_second_best:
+                    new_second_best = scores[i]
+            if new_second_best == -1: new_second_best = 0
+            
+            # 6. Mise à jour de l'histogramme du peloton
+            delta_pack = new_second_best - prev_second_best
+            
+            if delta_pack >= max_gain:
+                delta_pack = max_gain - 1 
+            elif delta_pack < 0:
+                delta_pack = 0
+                
+            occurrences[t, true_out] += 1
+            counts[t, true_out, delta_pack] += 1
+
+    p_empirique = np.zeros_like(counts)
+    for t in range(n_matches):
+        for out in range(3):
+            if occurrences[t, out] > 0:
+                p_empirique[t, out, :] = counts[t, out, :] / occurrences[t, out]
+                
+    return p_empirique
+
+# ==========================================
+# 2. LE MOTEUR ORACLE DP
+# ==========================================
+@njit(parallel=True)
+def solve_dp_with_full_empirical_distribution(base_true_probas, base_crowds, gains_1N2, p_empirique_1D, alphas_isolement, V_horizon, stop_t=0):
+    n_matches = base_true_probas.shape[0]
+    max_gain = p_empirique_1D.shape[2]
+    
+    V_all_matches = np.zeros((n_matches, GRID_SIZE, GRID_SIZE, 2), dtype=np.float32)
+    V_next = np.copy(V_horizon)
+
+    # 1. Condition Terminale
+    for g1 in range(GRID_SIZE):
+        val_g1 = g1 - GAP_OFFSET
+        for g2 in range(g1, GRID_SIZE): 
+            val_g2 = g2 - GAP_OFFSET
+            
+            if val_g1 > 0 and val_g2 > 0: win_prob = 1.0
+            elif (val_g1 == 0 and val_g2 > 0) or (val_g1 > 0 and val_g2 == 0): win_prob = 0.5
+            elif val_g1 == 0 and val_g2 == 0: win_prob = 1.0 / 3.0
+            else: win_prob = 0.0
+                
+            V_next[g1, g2, 0] = win_prob
+            V_next[g1, g2, 1] = win_prob
+
+    # 2. Rétro-propagation
+    for t in range(n_matches - 1, stop_t - 1, -1):
+        V_current = np.zeros((GRID_SIZE, GRID_SIZE, 2), dtype=np.float32)
+        t_prob = base_true_probas[t]
+        c_rep = base_crowds[t]
+        t_gains = gains_1N2[t]
+        alpha = alphas_isolement[t]  # <--- LECTURE DU GATING TEMPOREL
+        
+        for g1 in prange(GRID_SIZE):
+            val_g1 = g1 - GAP_OFFSET
+            for g2 in range(g1, GRID_SIZE): 
+                val_g2 = g2 - GAP_OFFSET
+                
+                best_v_b0 = 0.0 
+                best_v_b1 = 0.0 
+                
+                for a in range(3):
+                    expected_v_b0 = 0.0
+                    expected_v_keep = 0.0
+                    expected_v_use = 0.0
+                    
+                    for out in range(3):
+                        p_out = t_prob[out]
+                        if p_out == 0.0: continue
+                        
+                        a_g = t_gains[out] if a == out else 0
+                        a_g_boost = (t_gains[out] * 2) if a == out else 0
+                        true_gain = t_gains[out]
+                        out_p_empirique = p_empirique_1D[t, out]
+                        
+                        for bob_a in range(3):
+                            p_bob = c_rep[bob_a]
+                            if p_bob == 0.0: continue
+                            
+                            bob_g = true_gain if bob_a == out else 0
+                            jp_base = p_out * p_bob
+                            
+                            new_gap_bob_norm = val_g1 + a_g - bob_g
+                            new_gap_bob_boost = val_g1 + a_g_boost - bob_g
+                            
+                            esp_peloton_b0 = 0.0
+                            esp_peloton_keep = 0.0
+                            esp_peloton_use = 0.0
+                            
+                            for delta_gain in range(max_gain):
+                                p_peloton = out_p_empirique[delta_gain]
+                                if p_peloton == 0.0: continue
+                                    
+                                new_gap_peloton_norm = val_g2 + a_g - delta_gain
+                                new_gap_peloton_boost = val_g2 + a_g_boost - delta_gain
+                                
+                                # 🚀 TA FORMULE DE TRANSITION DE PHASE DE LA MEUTE 🚀
+                                val_g1_final_norm = min(new_gap_bob_norm, new_gap_peloton_norm)
+                                val_g2_final_norm = alpha * max(new_gap_bob_norm, new_gap_peloton_norm) + (1.0 - alpha) * new_gap_peloton_norm
+                                
+                                val_g1_final_boost = min(new_gap_bob_boost, new_gap_peloton_boost)
+                                val_g2_final_boost = alpha * max(new_gap_bob_boost, new_gap_peloton_boost) + (1.0 - alpha) * new_gap_peloton_boost
+                                
+                                # Arrondis et bornes
+                                g1_norm = max(GAP_MIN, min(GAP_MAX, int(round(val_g1_final_norm)))) + GAP_OFFSET
+                                g2_norm = max(GAP_MIN, min(GAP_MAX, int(round(val_g2_final_norm)))) + GAP_OFFSET
+                                g1_boost = max(GAP_MIN, min(GAP_MAX, int(round(val_g1_final_boost)))) + GAP_OFFSET
+                                g2_boost = max(GAP_MIN, min(GAP_MAX, int(round(val_g2_final_boost)))) + GAP_OFFSET
+                                
+                                esp_peloton_b0 += p_peloton * V_next[g1_norm, g2_norm, 0]
+                                esp_peloton_keep += p_peloton * V_next[g1_norm, g2_norm, 1]
+                                esp_peloton_use += p_peloton * V_next[g1_boost, g2_boost, 0]
+                                
+                            expected_v_b0 += jp_base * esp_peloton_b0
+                            expected_v_keep += jp_base * esp_peloton_keep
+                            expected_v_use += jp_base * esp_peloton_use
+
+                    if expected_v_b0 > best_v_b0: best_v_b0 = expected_v_b0
+                    best_action_b1 = max(expected_v_keep, expected_v_use)
+                    if best_action_b1 > best_v_b1: best_v_b1 = best_action_b1
+                        
+                V_current[g1, g2, 0] = best_v_b0
+                V_current[g1, g2, 1] = best_v_b1
+                
+        # Symétrie Safe
+        for g1 in prange(GRID_SIZE):
+            for g2 in range(g1 + 1, GRID_SIZE):
+                V_current[g2, g1, 0] = V_current[g1, g2, 0]
+                V_current[g2, g1, 1] = V_current[g1, g2, 1]
+                
+        V_next = V_current
+        V_all_matches[t] = V_current
+        
+    return V_all_matches
+
+
+@njit(parallel=True)
+def compute_full_Q_table(t, t_prob, c_rep, t_gains, p_empirique_1D, alpha, V_next, max_gain):
+    
+    Q_table = np.zeros((GRID_SIZE, GRID_SIZE, 3, 3), dtype=np.float32)
+    
+    for g1 in prange(GRID_SIZE):
+        val_g1 = g1 - GAP_OFFSET
+        for g2 in range(g1, GRID_SIZE):
+            val_g2 = g2 - GAP_OFFSET
+            
+            for a in range(3):
+                expected_v_b0 = 0.0
+                expected_v_keep = 0.0
+                expected_v_use = 0.0
+                
+                for out in range(3):
+                    p_out = t_prob[out]
+                    if p_out == 0.0: continue
+                    
+                    a_g = t_gains[out] if a == out else 0
+                    a_g_boost = (t_gains[out] * 2) if a == out else 0
+                    true_gain = t_gains[out]
+                    
+                    # 🚀 CORRECTION ICI : On utilise bien [t, out] pour cibler la matrice complète en 3D
+                    out_p_empirique = p_empirique_1D[t, out] 
+                    
+                    for bob_a in range(3):
+                        p_bob = c_rep[bob_a]
+                        if p_bob == 0.0: continue
+                        
+                        bob_g = true_gain if bob_a == out else 0
+                        jp_base = p_out * p_bob
+                        
+                        new_gap_bob_norm = val_g1 + a_g - bob_g
+                        new_gap_bob_boost = val_g1 + a_g_boost - bob_g
+                        
+                        esp_peloton_b0 = 0.0
+                        esp_peloton_keep = 0.0
+                        esp_peloton_use = 0.0
+                        
+                        for delta_gain in range(max_gain):
+                            p_peloton = out_p_empirique[delta_gain]
+                            if p_peloton == 0.0: continue
+                            
+                            new_gap_peloton_norm = val_g2 + a_g - delta_gain
+                            new_gap_peloton_boost = val_g2 + a_g_boost - delta_gain
+                            
+                            # La formule de Gating Temporel
+                            val_g1_final_norm = min(new_gap_bob_norm, new_gap_peloton_norm)
+                            val_g2_final_norm = alpha * max(new_gap_bob_norm, new_gap_peloton_norm) + (1.0 - alpha) * new_gap_peloton_norm
+                            
+                            val_g1_final_boost = min(new_gap_bob_boost, new_gap_peloton_boost)
+                            val_g2_final_boost = alpha * max(new_gap_bob_boost, new_gap_peloton_boost) + (1.0 - alpha) * new_gap_peloton_boost
+                            
+                            g1_norm = max(GAP_MIN, min(GAP_MAX, int(round(val_g1_final_norm)))) + GAP_OFFSET
+                            g2_norm = max(GAP_MIN, min(GAP_MAX, int(round(val_g2_final_norm)))) + GAP_OFFSET
+                            g1_boost = max(GAP_MIN, min(GAP_MAX, int(round(val_g1_final_boost)))) + GAP_OFFSET
+                            g2_boost = max(GAP_MIN, min(GAP_MAX, int(round(val_g2_final_boost)))) + GAP_OFFSET
+                            
+                            esp_peloton_b0 += p_peloton * V_next[g1_norm, g2_norm, 0]
+                            esp_peloton_keep += p_peloton * V_next[g1_norm, g2_norm, 1]
+                            esp_peloton_use += p_peloton * V_next[g1_boost, g2_boost, 0]
+                            
+                        expected_v_b0 += jp_base * esp_peloton_b0
+                        expected_v_keep += jp_base * esp_peloton_keep
+                        expected_v_use += jp_base * esp_peloton_use
+                
+                Q_table[g1, g2, a, 0] = expected_v_b0
+                Q_table[g1, g2, a, 1] = expected_v_keep
+                Q_table[g1, g2, a, 2] = expected_v_use
+                
+    # Symétrie
+    for g1 in prange(GRID_SIZE):
+        for g2 in range(g1 + 1, GRID_SIZE):
+            for a in range(3):
+                Q_table[g2, g1, a, 0] = Q_table[g1, g2, a, 0]
+                Q_table[g2, g1, a, 1] = Q_table[g1, g2, a, 1]
+                Q_table[g2, g1, a, 2] = Q_table[g1, g2, a, 2]
+                
+    return Q_table
+
 
 if __name__ == "__main__":
     compute_expected_V_phases_finales(8000)
