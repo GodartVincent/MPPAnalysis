@@ -62,6 +62,35 @@ def compute_alphas_isolement(true_probas, crowds, gains_1N2, seuil_isolement=120
         
     return alphas
 
+# --- MODÉLISATION DU CROWD MPP POUR FAVORIS/BUTEURS (Le Biais Chauvin / Héroïque) ---
+def estimate_mpp_crowd(selections, true_probs, gains, base_beta=1.2):
+    """
+    Part des probabilités true pour estimer la repartition Crowd des favoris/buteurs.
+    """
+    crowd_weights = true_probs ** base_beta
+    
+    # Biais de désirabilité / Chauvinisme
+    chauvinism_multiplier = np.ones(len(selections))
+    
+    for i, sel in enumerate(selections):
+        sel_lower = str(sel).lower()
+        
+        # Biais Énorme : La France et ses joueurs
+        if sel_lower in ['france', 'kylian_mbappe']:
+            chauvinism_multiplier[i] = 6.5
+            
+        # Biais Fort : Les superstars internationales (Ronaldo, Messi si présents)
+        elif sel_lower in ['portugal', 'cristiano_ronaldo', 'messi', 'argentine', 'bresil']:
+            chauvinism_multiplier[i] = 1.5
+            
+    # La catégorie "Autre" est historiquement sous-jouée par les casuals (biais de représentativité)
+    for i, sel in enumerate(selections):
+        if str(sel).lower() == 'autre':
+            chauvinism_multiplier[i] = 0.9
+            
+    final_weights = crowd_weights * chauvinism_multiplier
+    return final_weights / final_weights.sum()
+
 def generate_tournament_environment(env_config=None):
     """
     Génère un tournoi complet. Nous utiliserons les 32 derniers matchs.
@@ -629,6 +658,61 @@ def backpropagate_group_stages_stochastic(match_du_jour_idx, probas_poules, gain
         V_next = V_current
         
     return V_current
+
+@njit
+def rescale_histogram_1D(ref_hist, ref_gain, target_gain, target_crowd, max_bins=250):
+    """
+    Applique une transformation affine sur l'axe X d'une distribution de probabilité.
+    Forcé en entiers (int) pour la compatibilité stricte Numba.
+    """
+    # 🚀 BLINDAGE DES TYPES : On force les gains à être des index entiers
+    ref_g = int(round(ref_gain))
+    tgt_g = int(round(target_gain))
+    
+    scaled_hist = np.zeros(max_bins, dtype=np.float32)
+    
+    if ref_g <= 0 or tgt_g <= 0:
+        scaled_hist[0] = 1.0 
+        return scaled_hist
+        
+    scale_factor = tgt_g / ref_g
+    sum_scaled = 0.0
+    
+    for i in range(max_bins):
+        if i == ref_g:
+            continue # On ignore le pic de référence
+            
+        p = ref_hist[i]
+        if p > 0.0:
+            new_idx = int(round(i * scale_factor))
+            
+            if new_idx >= tgt_g:
+                new_idx = max(0, tgt_g - 1)
+                
+            if new_idx >= max_bins:
+                new_idx = max_bins - 1
+                
+            scaled_hist[new_idx] += p
+            sum_scaled += p
+            
+    if sum_scaled > 0.0:
+        norm_factor = (1.0 - target_crowd) / sum_scaled
+        for i in range(max_bins):
+            scaled_hist[i] *= norm_factor
+    else:
+        scaled_hist[0] = 1.0 - target_crowd
+        
+    # Le calcul d'index est maintenant 100% sécurisé avec des entiers
+    idx_pic = min(tgt_g, max_bins - 1)
+    scaled_hist[idx_pic] = target_crowd
+    
+    total = np.sum(scaled_hist)
+    if total > 0:
+        scaled_hist /= total
+    else:
+        scaled_hist[0] = 1.0
+        
+    return scaled_hist
 
 @njit
 def extract_peloton_full_distribution(true_probas_3d, crowds_3d, gains_1N2, max_gain=250, n_runs=1000000, n_players=11):

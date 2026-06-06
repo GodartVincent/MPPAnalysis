@@ -1,207 +1,68 @@
-# MonPetitProno (MPP) Strategy Simulator - V3
+# 🏆 MonPetitProno Strategy : Solveur de Tournoi (DP & Monte-Carlo)
 
-This repository contains a sophisticated **Reinforcement Learning (RL)** system designed to solve the "MonPetitProno" (MPP) football prediction tournament.
+Ce dépôt contient un algorithme complet d'aide à la décision pour le jeu MonPetitProno (Coupe du Monde/Euro). Il repose sur une architecture hybride mêlant **Programmation Dynamique (Équation de Bellman)** pour la rétro-propagation des probabilités de victoire, et **Simulations Monte-Carlo** pour modéliser la thermodynamique du tournoi et le comportement des autres joueurs (le "Peloton").
 
-Unlike standard betting models that simply maximize Expected Value (EV), this agent optimizes for **Tournament Win Probability**. It learns to navigate a noisy, adversarial environment populated by "Lambda" (casual) players who exhibit realistic betting biases (herding).
-
-**Current Version:** `v3.0` (Power Law Opponents & Domain Randomization)
+Le but n'est pas de deviner qui va gagner, mais de **maximiser le Win Rate global** de l'Agent contre ses adversaires directs (Bob, meilleur adversaire) et la masse des joueurs, en optimisant la prise de risque (ex: utiliser le Booster, parier contre la foule, etc.).
 
 ---
 
-## 🧠 The "V3" Intelligence: The Cynical Detective
+## ⚙️ 1. Workflow Opérationnel (Comment utiliser le repo)
 
-Through **Domain Randomization** and **Curriculum Learning**, the V3 agent has evolved beyond simple statistics. It has developed a distinct psychological profile we call the **"Cynical Detective"**:
+Le cycle de vie de l'algorithme est divisé en trois grandes phases. Les 3 sources de vérité (SSOT) pour le tournoi sont les 3 fichiers suivants :
+- `data/CDM_2026.csv` qui renseigne les côtes, gains MPP et crowds (répartition des joueurs sur les outcomes) pour chacun des matchs connus. Il est utile tout au long du tournoi.
+- `data/CDM_2026_goal_scorer_and_favorite.csv` qui renseigne les côtes et gains mpp pour les favoris et meilleurs buteurs. Utile seulement pour la phase de groupe (`bracket_simulator.py` et `Notebook 16`).
+- `data/CDM_2026_group_stage_odds.csv` qui contient, pour chaque équipe du tournoi, sa côte de victoire finale, de victoire dans sa poule et de qualification en 16e. Utile seulement pour la phase de groupe (`bracket_simulator.py`).
 
-1.  **Rational Aggression:**
-    * **Leading:** Plays conservatively (bets Favorite) to protect its lead.
-    * **Trailing:** Takes calculated risks, but *never* blindly.
-2.  **The "Trap" Detector:**
-    * It refuses to bet on high-paying Outsiders if the gain implies a near-zero probability. It perceives "too good to be true" odds as traps.
-3.  **Mispriced Safety:**
-    * When desperate, it targets **"Low-Value Outsiders"**—bets that pay poorly but are statistically more likely to hit than the odds suggest. It prefers **consistency over lottery tickets**.
+### Phase A : Avant le Tournoi (Préparation & Initialisation)
+1. **`bracket_simulator.py`** : À lancer en premier. Il simule 250 scénarios complets du tournoi (depuis les poules connues jusqu'à la finale, en simulant de manière réaliste les phases finales encore inconnues) pour pré-calculer "l'Horizon". Il génère la matrice géante `expected_V_phases_finales_full.npy` (l'espérance de win rate de l'agent à l'entrée des 16èmes de finale).
+2. **`Notebook 15` (Thermodynamique du Peloton)** : À lancer juste après le simulateur. Il utilise des méthodes de Monte-Carlo pour calculer l'évolution probabiliste du score du meilleur des poursuivants (le peloton : tous les adversaires sauf Bob) au fil de la compétition. Mathématiquement, il génère les histogrammes de transition pour la variable d'état `gap_2` (l'écart de points entre l'Agent et le peloton), indispensables au chaînage temporel de la Programmation Dynamique.
+3. **`Notebook 16` (Choix des Favoris/Buteurs)** : Utilise l'Horizon généré pour rajouter fictivement en "Match 0" les choix de Favori et de Meilleur Buteur. Fait tourner la DP pour déterminer le combo qui maximise le Win Rate.
+4. Renseigner les choix définitifs dans le `Notebook 10`.
 
----
+### Phase B : Pendant les Poules (Matchs 1 à 72)
+1. **`Notebook 10` (Cockpit Poules)** : À lancer avant chaque match. Il lit les côtes fraîches (dans `data/CDM_2026.csv`), applique le bruit et le drift, résout la DP jusqu'à l'Horizon, et donne la recommandation exacte (Issue + Choix Booster x2) pour le(s) match(s) du jour. Il est exécutable depuis téléphone.
+2. Il génère automatiquement les `.npz` (Abaques ou Q-Tables) pour les 5 matchs suivants.
+3. **`Notebook 17` (Mode Nuit / Mobile)** : Peut être ouvert sur téléphone pendant la journée. Il lit les `.npz` sans avoir besoin de refaire tourner les calculs lourds, permettant d'ajuster son pronostic de dernière minute selon son avancement en direct au classement.
 
-## 🔬 Key Technical Features
-
-### 1. Realistic Opponent Modeling (Power Law)
-Casual players do not bet randomly. They "herd" onto favorites. V3 models this using a **Power Law** distribution:
-$$\text{Share}_i = \frac{P_i^\gamma}{\sum P_k^\gamma}$$
-* $\gamma \approx 2.0$: Standard herding behavior.
-* The agent learns to exploit this by finding value in the under-bet Draw/Outsider markets.
-
-### 2. Domain Randomization
-To prevent overfitting to a specific tournament structure, the agent is trained in a chaotic environment where every episode has different rules:
-* **Variable EV:** Average match scores range from 25 to 45 points.
-* **Variable League Size:** Competes against 6 to 25 opponents.
-* **Noisy Information:** The agent receives imperfect estimates of future match points and crowd behavior.
-
-### 3. Value Injection Training
-The simulator artificially "injects" value (pricing errors) into the training data to force the agent to decouple **Gain** from **Probability**. This teaches the agent to read the board like a human analyst rather than relying on simple heuristics (like "High Gain = Low Probability").
+### Phase C : Pendant les Phases Finales (Matchs 73 à 104)
+1. Renseigner les vainqueurs/qualifiés de chaque match passé dans la colonne `result` du `CDM_2026.csv`. **Attention : Ne pas utiliser ce mode avant de connaître l'intégralité des 16 affiches des 16èmes de finale** (Voir *Paradoxe du Clonage* dans les limitations).
+2. **`bracket_simulator.py` (Mode Horizon Glissant)** : À lancer chaque soir après les matchs. Il détecte automatiquement les affiches connues dans le CSV, "écrase" son arbre simulé avec la réalité, simule la suite au hasard, et génère un nouvel horizon `V_phases_finales_final.npy` mis à jour.
+3. **`Notebook 18` (Cockpit Phases Finales)** : Remplace le Notebook 10 pour les phases finales. Fait tourner la programmation dynamique sur la matrice de la nuit et les côtes du jour, et donne la recommandation immédiate en prenant en compte la survie des favoris de l'Agent et de ses adversaires.
 
 ---
 
-## 📂 Project Structure
+## 🔍 2. Sous le Capot : Détail Mécanique des Composants
 
-```
+Voici le détail précis du traitement algorithmique opéré par chaque module principal du projet :
 
-mppanalysis/
-│
-├── mpp_project/          # The core Python package
-│   ├── core.py               # Core math and utility functions
-│   ├── match_simulator.py    # Generates realistic match data (probas, gains, etc.)
-│   ├── simulation.py         # The main tournament simulation engine
-│   ├── mpp_env.py            # Custom Gymnasium Environment (The Dojo)
-│   └── strategies.py         # Defines all "agent" strategies to be tested
-│
-├── notebooks/              # Jupyter notebooks for exploration and analysis
-│   ├── 00_analysis_single_match_ev.ipynb         # Explores the expected value calculations for individual match bets to establish a baseline for betting efficiency.
-│   ├── 01_analysis_by_match_count.ipynb          # Analyzes how strategy performance and variance evolve as the number of matches in a tournament increases.
-│   ├── 02_analysis_by_success_prob.ipynb         # Investigates the impact of varying prediction success probabilities on the overall tournament outcome.
-│   ├── 03_analysis_variable_p_bernoulli.ipynb    # Models match outcomes using Bernoulli trials with variable probabilities to simulate realistic tournament dynamics.
-│   ├── 04_analysis_final_score_distribution.ipynb # Compares the final score distributions of different strategies to visualize their risk/reward profiles.
-│   ├── 05_analysis_agent_psychology.ipynb        # Performs an "MRI scan" of the trained agent to map its decision-making boundaries relative to score gaps and match certainty.
-│   ├── 06_analysis_value_sensitivity.ipynb       # Tests the agent's ability to identify and exploit "value bets" (mispriced odds) under different tournament conditions.
-│   └── 07_analysis_crowd_psychology.ipynb        # Tests the agent's dependency to crowd betting repartition. 
-│
-├── .gitignore
-├── play.py                       # Script to get the Agent decision for a real world match
-├── requirements.txt
-├── run_tournament_simulation.py  # MAIN SCRIPT: Runs the full simulation and prints results
-├── train_agent.py                # Script to train the RL agent through the curriculum
-└── README.md                     # Project documentation
+* **`Notebook 10` (Inférence Poules)** : Lit `CDM_2026.csv`. Simule le *drift* temporel pour chacun des matchs futurs (mais pas pour le match courant). Met à jour les *crowds* futurs via une moyenne pondérée (Bayésienne) entre le *crowd* renseigné dans le CSV et celui qui découlerait théoriquement des nouvelles `true_probas` (avec un poids dégressif selon le nombre de matchs d'écart avec le présent). Afin de ne pas être adhérent à un unique tirage de *drift*, la DP tourne sur un multivers de réalisations du *drift* et moyenne les matrices de Win Rates obtenues. La DP part de l'horizon (`expected_V_phases_finales_full.npy`) et rétro-propage jusqu'au match courant.
+* **`Notebook 15` (Génération du Peloton)** : Utilise des méthodes de Monte-Carlo pour construire la matrice de transition tridimensionnelle du peloton (`p_empirique_1D.npy`). Il calcule, pour chaque match et chaque issue possible, la distribution de probabilité des points gagnés par le meilleur poursuivant. C'est le moteur de transition de la variable d'état `gap_2` pour l'équation de Bellman. Comme ces histogrammes empiriques sont ensuite utilisés de manière indépendante d'un match à l'autre, l'effet de "yoyo" du peloton n'est pas modélisé. Si le peloton commence à sous-performer il se densifie mécaniquement ce qui augmente sa probabilité de bien performer à l'avenir, et inversement. De ce fait, la distribution réelle de points du peloton a moins de variance que notre modélisation. Il a été fait le choix d'utiliser cet excès de variance pour simuler les bonus scores exacts et les bonus x2 des adversaires. On rajoute donc quelques adversaires (voir les distributions de points) pour augmenter la moyenne de points du peloton et simuler leurs bonus x2 en moyenne. On a donc une modélisation des points du peloton qui est plutôt satisfaisante en moyenne et en variance. Néanmoins, chaque scénario spécifique n'est pas réaliste : la modélisation produit beaucoup moins d'a-coups du peloton (gros bonus score exact ou gros bonus x2), ce qui rend l'agent certainement moins résilient à ces cas de figure.
+* **`Notebook 16` (Optimisation du Portfolio)** : Lit `CDM_2026.csv`, les résultats de `bracket_simulator` et `CDM_2026_goal_scorer_and_favorite.csv`. Il rajoute fictivement et itérativement en "Match 0" le choix du favori puis du meilleur buteur, et fait tourner la DP pour trouver le portefeuille maximisant l'espérance de victoire au T0. Encore une fois, il fait tourner plusieurs DP avec plusieurs réalisations du drift et donne la moyenne des win rates obtenus.
+* **`bracket_simulator.py` (Le Cerveau Central)** : Moteur universel de topologie. 
+    * *Avant tournoi* : Simule les qualifiés de chaque poule/les 16e par Monte-Carlo. Calcule d'abord les probabilités de qualification en 8e de chaque équipe des 16e en se basant sur leurs probabilités de victoire finale dans `CDM_2026_goal_scorer_and_favorite.csv` (p_qualif_1 = p_vict_1 / (p_vict_1 + p_vict_2)). Rajoute un léger bruit gaussien (écart type de 0.03 additif). Il calcule ensuite la probabilité de match nul au bout de 90 minutes grâce au fit quadratique fait en `Notebook 19` sur les données de Premier League. Il en déduit les 3 `true_probas` du match. Ils servent à déterminer les 3 `gain_mpp` via le fit quadratique fait dans le Notebook 12 avec ajout de bruit gaussien multiplicatif. Il calcule ensuite les `true_probas` à la fin des 120 minutes et y rajoute le drift. Ce sont ces dernières `true_probas` qui sont utilisées pour déterminer les `crowds` du match, via le fit fait dans le `Notebook 13`, avec ajout de bruit hétéroscédastique. Une fois les données de tous les matchs déterminées de cette manière, il calcule l'évolution moyenne des histogrammes de *gap_2* pour chaque match de phase finale. Puis il fait un second Monte-Carlo pour résoudre la DP sur tous ces brackets et moyenner les matrices de Win Rates à l'entrée des 16èmes.
+    * *Pendant les phases finales* : Écrase dynamiquement son arbre de simulation avec les résultats connus du CSV (Reality Override), simule le reste, et recalcule la matrice de win rate horizon.
+* **`Notebook 18` (Inférence Phases Finales)** : Remplace le Notebook 10. Ne calcule pas d'horizon lointain (il charge le `.npy` généré par le simulateur `bracket_simulator.py`). Il s'occupe uniquement du match courant, avec l'avantage de filtrer les décisions de l'Agent en prenant en compte de manière déterministe les favoris choisis par l'Agent, Bob et le peloton (faut-il parier contre son propre favori pour se couvrir, etc.). Les buteurs sont évalués statiquement dans l'état terminal.
 
-````
+---
 
-## 🚀 How to Run the Simulation
+## 🧠 3. Modélisation Mathématique & Notebooks Utilitaires
 
-1.  **Clone the repository:**
-    ```bash
-    git clone [https://github.com/godartvincent/mppanalysis.git](https://github.com/godartvincent/mppanalysis.git)
-    cd mppanalysis
-    ```
+L'algorithme s'appuie sur des données réelles scrapées pour modéliser le comportement de la compétition et du marché. Si les données de base changent, les notebooks suivants doivent être relancés pour extraire les nouveaux coefficients à mettre en dur dans le code.
 
-2.  **Set up a virtual environment (Recommended):**
-    ```bash
-    python -m venv venv
-    source venv/bin/activate  # On Windows: venv\Scripts\activate
-    ```
+* **Notebooks 12 & 13 (Calibration de la Foule et des Gains)** : Modélisent le lien entre la `true_proba` (la probabilité réelle issue des côtes des bookmakers purifiées de leur marge), le `gain_mpp` (fixé par l'application), et le `crowd` (la répartition des pourcentages de votes des joueurs). Calibrés sur les données d'ouverture de MPP.
+* **Notebook 14 (Le Drift Temporel)** : Les côtes MPP sont fixées plusieurs jours, voire semaines, à l'avance, mais les vraies probabilités évoluent jusqu'au coup d'envoi. Ce notebook quantifie cet *Edge* (avantage de l'Agent) en mesurant l'écart type entre les `true_proba` d'ouverture et de fermeture sur une saison entière de Premier League. Pour les journées 2 et 3 des poules, où les `gain_mpp` sont renseignés avant le premier match, le paramètre est gonflé artificiellement selon la volatilité du classement FIFA Elo.
+* **Notebook 19 (Modélisation du Match Nul)** : Essentiel pour les phases finales. Calcule le taux de matchs nuls à 90 minutes (`true_proba_N`) en fonction de l'écart de force relative entre deux équipes (`|true_proba_1 - true_proba_2|`). Utilise une régression quadratique sur la Premier League avec un bruit multiplicatif hétéroscédastique (RMSE de ~6.8%).
 
-3.  **Install dependencies:**
-    ```bash
-    pip install -r requirements.txt
-    ```
+---
 
-4.  **Train the Agent:**
+## ⚠️ 4. Hypothèses, Simplifications et Limitations Connues
 
-    The training uses a 4-Phase Curriculum to guide the agent from "Novice" to "Grandmaster":
+Pour conserver un temps de calcul gérable (Model Predictive Control), plusieurs raccourcis assumés ont été pris :
 
-    ```bash
-    # Run from the root directory
-    python -m mpp_project.train_agent
-    ```
-    Phase 1: Deterministic Warmup (Learn the rules).
-
-    Phase 2: Calibration (Learn to beat Mixed opponents).
-
-    Phase 3: The Real Game (Beat 11 Power-Law Randoms).
-
-    Phase 4: Robustness (Full Domain Randomization).
-
-4.  **Run the simulation:**
-    ```bash
-    python run_tournament_simulation.py
-    ```
-    This will run `N_SAMPLES` (e.g., 20000) full tournaments for each strategy, pitting each "challenger" against a league of `N_PLAYERS - 1` "typical" opponents. It will then print the final results table and display a plot of the score distributions.
-
-5.  **Ask the Agent for Advice (Real World):**
-
-    Input real match odds to get a recommendation:
-
-    ```bash
-    python play.py
-    ```
-
-## 📊 Performance
-
-The simulation was run with `N_SAMPLES = 20000` tournaments in which each strategy were evaluated against 11 other players.
-
-### Final Simulation Results (20000 tournaments per strategy)
-
-Strategy                 | Win Rate | Avg Points |   Median   |  Std Dev
-| :--- | :---: | :---: | :---: | :---: |
-RL V3 (P4 - DomainRnd)   |   13.49% |  1661.1pts |  1629.0pts | 459.76pts
-RL V2 (P3 - MoreRand)    |   13.41% |  1746.0pts |  1709.0pts | 374.86pts
-Adaptive Simple EV       |   12.98% |  1635.6pts |  1590.0pts | 470.97pts
-RL V3 (P3 - FullRand)    |   12.93% |  1763.2pts |  1790.0pts | 439.37pts
-RL V2 (P4 - FullRand)    |   12.68% |  1715.3pts |  1697.0pts | 406.49pts
-RL V2 (P5 - DomainRnd)   |   12.46% |  1682.5pts |  1675.0pts | 412.93pts
-RL V3 (P2 - Mixed)       |   12.39% |  1776.8pts |  1835.0pts | 447.23pts
-RL V2 (P2 - Mixed)       |   12.39% |  1722.1pts |  1688.0pts | 372.96pts
-RL V3 (P1 - PPO)         |   12.34% |  1829.0pts |  1893.0pts | 420.59pts
-RL Legacy (V1 - 4M)      |   11.59% |  1857.6pts |  1894.0pts | 388.94pts
-RL V2 (P1 - PPO)         |   11.45% |  1773.3pts |  1875.0pts | 478.31pts
-Best Simple EV           |   11.21% |  1995.1pts |  1995.0pts | 282.08pts
-Favorite                 |   10.79% |  1991.8pts |  1991.0pts | 280.69pts
-Safe Simple EV           |   10.71% |  1991.6pts |  1990.0pts | 280.99pts
-Adaptive Simple Rel EV   |    7.20% |  1436.1pts |  1397.0pts | 421.79pts
-Random                   |    5.18% |  1631.1pts |  1621.0pts | 338.68pts
-Safe Simple Rel EV       |    4.25% |  1488.0pts |  1484.0pts | 365.45pts
-Best Simple Relative EV  |    3.86% |  1460.5pts |  1445.0pts | 362.36pts
-Highest Variance         |    3.70% |  1435.1pts |  1426.0pts | 369.73pts
-
-*(Note: The expected win rate for a "lambda" (typical) player is 1/12 = 8.33%)*
-
-### 📊 Analysis of Key Insights
-
-This table reveals several powerful (and sometimes paradoxical) insights into tournament strategy.
-
-#### 1. The "EV Edge" (Maximizing Points)
-The **`Best Simple EV`** strategy is a massive success for maximizing points. It achieves the highest **average score** (1995.1 pts) by a huge margin. This validates the "Value" hypothesis: by calculating $EV = P_{\text{true}} \cdot G_{\text{frozen}}$, this strategy effectively identifies "mispriced" value bets, significantly outperforming baselines like `Best Simple Relative EV` or `Random`.
-
-#### 2. The "Game Theory Edge" (Maximizing Wins)
-Among the heuristic strategies, **`Adaptive Simple EV`** is the clear winner. Despite having a *lower* average score (1635.6 pts) than the pure EV strategies, its **win rate is 12.98%**, making it the best heuristic for consistently beating the "lambda" baseline (8.33%). This confirms the "Game Theory" hypothesis:
-* **Sacrificing EV for Position:** It wins *because* it does not purely maximize points.
-* **Leading:** It plays defensively with "safe" blocking bets (`np.argmax(opp_repartition)`) to lock in the win.
-* **Trailing:** It plays aggressively with high-risk bets (`np.argmax(match_gains)`) to create variance and catch up.
-* This strategy correctly identifies that maximizing *points* is fundamentally different from maximizing *wins*.
-
-#### 3. The Failure of "Relative EV"
-Strategies based on "Relative EV" (`strat_best_simple_rel_ev`) performed poorly. The opponent model (`opp_repartition`) assumes heavy herding toward the favorite. Consequently, the `(1 - opp_repartition)` factor dominates the decision-making, turning the strategy into a "Contrarian" that systematically selects high-risk, low-EV outcomes just to be different, resulting in a poor average score.
-
-#### 4. The Variance Paradox: Static vs. Dynamic Risk
-`Adaptive Simple EV` exhibits one of the **highest tournament variances (Std Dev = 470.97)**. Interestingly, a `Highest Variance` strategy that *statically* picks the most volatile bet per match had a *lower* final variance (369.73).
-
-**The Paradox:**
-* A **static policy** (like `Highest Variance`) is subject to the Central Limit Theorem. Summing 51 independent high-variance outcomes still produces a normal, bell-shaped distribution where most final scores cluster near the mean.
-* A **dynamic/adaptive policy** effectively *fights* the Central Limit Theorem. It creates a **"barbell" distribution**:
-    * **If Ahead:** The agent plays safely, keeping its simulation in the **"high score" pole**.
-    * **If Behind:** The agent takes "all-or-nothing" bets. Failure keeps it in the **"low score" pole**, while success rockets it toward the "high score" pole.
-
-This dynamic switching manufactures a distribution with two extremes and a hollowed-out middle, increasing the probability of landing in the top percentile (winning). This principle is also exploited by the RL agents, with `RL V2 (P1 - PPO)` showing the highest variance in the tournament.
-
-#### 5. RL Agents Outperform "Best EV"
-As shown in the final score distribution graph, `Best Simple EV` clearly produces the most optimal Gaussian-shaped distribution. However, all RL agents manage to beat this baseline by cleverly sacrificing some EV to access the "tail" of the distribution (higher scores) when necessary. This adaptive behavior creates heavy-tailed distributions that are statistically more likely to win a tournament.
-
-#### 6. The Legacy Dense Reward (`RL Legacy (V1 - 4M)`)
-The "legacy" reward function encouraged the agent to balance frequent point-scoring (betting Favorite/EV) with winning. As a result, it achieves the highest average score among all RL agents and the lowest variance, making it a consistent but less "aggressive" winner.
-
-#### 7. The Tanh Reward Shift
-From V2 onwards, the reward function was changed to a **Tanh Potential** based on the score gap. This created a fundamental shift in mentality: the **only** way to get a high reward is to keep pace with or beat the leader. There is no reward for being "good on average," only for being "excellent relative to the leader."
-
-Consequently, V2 and V3 agents score worse on average than the Legacy agent but achieve (mostly) higher win rates, proving they are better optimized for the specific goal of taking 1st place.
-
-#### 8. Key Results for RL Agents
-Despite the heavy stochasticity of the environment, clear trends emerge:
-* **Variance as a Weapon:** To beat increasingly tough opponents, agents learn to convert average score into variance. `RL V2 (P3 - MoreRand)` is unique in maintaining a high win rate, high average score, and low variance simultaneously.
-* **Progression:** As the training phases progress, the agents become more sophisticated, eventually surpassing the `Adaptive Simple EV` heuristic.
-* **Generalization:** The shift to Power Law opponents in V3 did not degrade the performance of V2 agents (trained on different opponents). Their win rates remained stable, indicating that the strategies learned in V2 generalize well to different crowd behaviors.
-
-#### 9. The Best Strategy
-The top-performing strategy is **`RL V3 (P4 - DomainRnd)`**.
-The introduction of Domain Randomization did not hurt its performance in standard tournaments. Instead, it produced a robust agent that plays safely but takes calculated risks when necessary, achieving a strong **13.49% win rate** against 11 lambda players—approximately **1.6x better than random chance**.
-
-## 🔮 Future Work
-
-* **Perfect Score Bonus:** Integrate the "Exact Score" mechanic into the environment. Simulating representative perfect score probabilities would add complexity but likely push the strategy slightly back towards `Best Simple EV` (since RL agents would still have an edge when they make the same bet as opponents).
-* **2026 World Cup Format:** Update the `n_matches` and tournament structure to reflect the new expanded format.
+1. **La Règle des 120 Minutes (MPP)** : L'algorithme lit les côtes des bookmakers à 90 minutes (pour générer les gains MPP), mais convertit mathématiquement ces probabilités en format "120 minutes + Tirs au but" pour estimer la survie dans l'arbre. La conversion se fait avec l'hypothèse que, sachant match nul à 90, la probabilité que le match se termine au tirs au but (nul à 120) suit une loi uniforme entre 40 et 50%.
+2. **Le "Paradoxe du Clonage" (16èmes de finale)** : Le script `bracket_simulator.py` génère les qualifiés depuis les poules. Si les 16e sont renseignés *partiellement* dans le CSV, l'algorithme peut simuler 'Espagne finit 2e de sa poule', tandis que l'Espagne finit en fait première et est renseignée dans le csv, ce qui créerait un duplicata. . **Règle métier :** Ne jamais renseigner partiellement le tableau des 16e. Soit tout est simulé, soit les 16 affiches sont connues. Ce problème n'existe plus à partir des 8èmes grâce à la topologie stricte de l'arbre.
+3. **Indépendance des Buteurs (Décorrélation)** : Lors de la Programmation Dynamique, la matrice terminale (`V_term`) évalue la probabilité qu'un joueur finisse Meilleur Buteur de manière statique. L'algorithme ne lie pas directement la survie d'une équipe dans l'arbre simulé avec la probabilité de son buteur. Cela crée une légère sous-estimation de la variance des adversaires ayant le combo classique (ex: France + Mbappé), mais a un impact négligeable sur les décisions à horizon immédiat.
+4. **Pas de mise à jour bayésienne des "Petits Poucets"** : La force d'une équipe est définie par sa côte de victoire finale d'avant-tournoi. Si, *dans l'horizon temporel*, une petite équipe atteint les demi-finales, l'algorithme continuera de la considérer mathématiquement comme faible (pas d'effet *Momentum*).
+5. **Pas de modélisatrion réaliste des bonus x2 des adversaires** : Comme vu dans la section sur le `Notebook 15`, le bonus x2 a été "modélisé" en rajoutant artificiellement quelques adversaires au peloton. Ceci augmente son gain moyen par match, rendant son score final réaliste mais pas sa progression. Aucun à-coup et gain supérieur à gain_mpp n'est simulé.
+6. **Pas de modélisatrion réaliste des bonus scores exacts** : Comme vu dans la section sur le `Notebook 15`, la modélisation du peloton conduit à une sur-estimation de la variance de ses points. C'est aussi l'effet qu'a le bonus de score exact. Ainsi, même si rien n'a été fait pour modéliser ce bonus, l'agent est déjà robuste à ses effets. Pour compléter ce réalisme en variance, on pourrait essayer de réduire légèrement la moyenne des gains relatifs du peloton par rapport à l'agent pour modéliser son edge sur les scores exacts. Néanmoins, ceci étant un effet opposé au bonus x2 des adversaires, et sa quantification étant très difficile, il a été fait le choix de ne pas modéliser cet edge. Le peloton modélisé est donc assez certainement plus coriace que le peloton réel.
+7. **Modélisation d'adversaires idiots mais chanceux** : On ne modélise aucune stratégie de nos adversaires. Ils sont tous interchangeables donc le meilleur adversaire ne fait pas de choix plus judicieux qu'un autre, il est juste plus chanceux. Les adversaires ne s'adaptent aucunement à leurs situations.

@@ -259,18 +259,12 @@ def simulate_true_proba_from_gain(gain_mpp, rmse=RMSE_GAINS, a=CUBIC_A, b=CUBIC_
 
     return proba_est
 
-def apply_temporal_drift(true_probas: np.ndarray, match_phases: list, current_match_idx: int) -> np.ndarray:
+def apply_temporal_drift(true_probas: np.ndarray, match_phases, current_match_idx: int = 0) -> np.ndarray:
     """
-    Simule la variation des probabilités réelles via un modèle de 'Drift Relatif'.
-    L'incertitude dépend du nombre de matchs qu'une équipe doit encore jouer 
-    entre le 'current_match_idx' et le match cible.
+    Simule la variation des probabilités réelles au fil du temps via un modèle de 'Drift Relatif'.
+    Gère à la fois une matrice de matchs (N, 3) et un match unique vectorisé (3,).
     """
-    n_matches = len(true_probas)
-    drifted_probas = np.copy(true_probas)
-    
-    current_phase_str = match_phases[current_match_idx] if current_match_idx < n_matches else "Phase Finale"
-    
-    # Fonction utilitaire pour extraire le "Niveau d'Information"
+    # Fonction utilitaire
     def get_phase_level(p_str):
         if not isinstance(p_str, str): return 4
         if "J1" in p_str: return 1
@@ -278,52 +272,68 @@ def apply_temporal_drift(true_probas: np.ndarray, match_phases: list, current_ma
         if "J3" in p_str: return 3
         return 4 # Phases Finales
         
+    # ========================================================
+    # CAS 1 : UN SEUL MATCH (Appelé par bracket_simulator.py)
+    # true_probas est de forme (3,)
+    # ========================================================
+    if true_probas.ndim == 1:
+        # Ici, match_phases est une simple chaîne (ex: "16e")
+        phase_str = match_phases if isinstance(match_phases, str) else "Phase Finale"
+        target_level = get_phase_level(phase_str)
+        
+        # En phases finales, le drift est un bruit de fond standard
+        std_dev = 0.025 if target_level == 4 else 0.035
+            
+        noise = np.random.normal(1.0, std_dev, 3)
+        drifted_probas = true_probas * noise
+        
+        # Bornes et normalisation vectorielle directe (pas de boucle)
+        drifted_probas = np.clip(drifted_probas, MIN_TRUE_PROBA, MAX_TRUE_PROBA)
+        return drifted_probas / np.sum(drifted_probas)
+        
+    # ========================================================
+    # CAS 2 : MATRICE DE MATCHS (Appelé par oracle_dp.py)
+    # true_probas est de forme (N, 3)
+    # ========================================================
+    n_matches = len(true_probas)
+    drifted_probas = np.copy(true_probas)
+    
+    # Récupération sécurisée (évite les IndexError)
+    if isinstance(match_phases, list) and current_match_idx < len(match_phases):
+        current_phase_str = match_phases[current_match_idx]
+    else:
+        current_phase_str = "Phase Finale"
+        
     current_level = get_phase_level(current_phase_str)
     
     for i in range(n_matches):
-        phase = match_phases[i]
+        phase = match_phases[i] if (isinstance(match_phases, list) and i < len(match_phases)) else "Phase Finale"
         
         # Le passé ou le match du jour est connu avec certitude
         if i <= current_match_idx:
             continue
             
         target_level = get_phase_level(phase)
-        
-        # Calcul du Delta d'Information (Combien de matchs mystères séparent la cible de notre savoir actuel ?)
         shocks_remaining = target_level - current_level
         
         # --- LOGIQUE DE DRIFT RELATIF ---
         if target_level == 4:
-            # Phases finales : les forces sont connues par tout le monde. 
-            # Le drift redevient un simple bruit de compétition (ex: fatigue, blessure).
             std_dev = 0.025
-            
         elif shocks_remaining <= 0:
-            # On est dans la même phase (ex: on est en J2, on prédit le match de demain qui est aussi en J2)
-            # Les cotes du CSV intègrent déjà le choc précédent. Juste du bruit de fond.
+            std_dev = 0.025 
+        elif shocks_remaining == 1:
+            std_dev = 0.035 
+        elif shocks_remaining >= 2:
+            std_dev = 0.06 
+        else:
             std_dev = 0.025 
             
-        elif shocks_remaining == 1:
-            # 1 match de décalage (ex: On est en J1 et on prédit la J2, ou J2 vers J3)
-            # Il manque l'information d'un match complet.
-            std_dev = 0.035 
-            
-        elif shocks_remaining >= 2:
-            # 2 matchs de décalage (ex: On est en J1 et on regarde jusqu'en J3)
-            # L'incertitude est maximale.
-            std_dev = 0.06 
-            
-        else:
-            std_dev = 0.025 # Fallback de sécurité
-            
-        # Application du drift multiplicatif
         noise = np.random.normal(1.0, std_dev, 3)
+        
+        # Ici true_probas[i] est un tableau (3,) et noise est (3,), la multiplication est valide
         drifted_probas[i] = true_probas[i] * noise
         
-        # Bornes logiques du football
         drifted_probas[i] = np.clip(drifted_probas[i], MIN_TRUE_PROBA, MAX_TRUE_PROBA)
-        
-        # Normalisation obligatoire (somme = 1)
         drifted_probas[i] = drifted_probas[i] / np.sum(drifted_probas[i])
         
     return drifted_probas
