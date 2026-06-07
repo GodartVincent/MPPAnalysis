@@ -258,7 +258,9 @@ def generate_bracket_scenario(df_odds, df_tournoi=None):
     # 2. L'ÉCRASEMENT PAR LA RÉALITÉ (The Override)
     df_pf = None
     if df_tournoi is not None:
-        mask_pf = df_tournoi['phase'].str.contains('16e|8e|Quart|Demi|Finale', na=False)
+        # case=False : robuste à la casse (la convention CSV est en minuscules :
+        # 16e, 8e, quart, demi, finale) ; aucune phase de poule ne contient ces motifs.
+        mask_pf = df_tournoi['phase'].str.contains('16e|8e|quart|demi|finale', case=False, na=False)
         df_pf = df_tournoi[mask_pf].reset_index(drop=True)
 
     # Initialisation des matrices de l'Oracle

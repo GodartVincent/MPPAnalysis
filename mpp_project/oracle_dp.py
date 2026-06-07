@@ -763,116 +763,286 @@ def extract_peloton_full_distribution(true_probas_3d, crowds_3d, gains_1N2, max_
 # 2. LE MOTEUR ORACLE DP
 # ==========================================
 @njit(parallel=True)
-def solve_dp_with_full_empirical_distribution(base_true_probas, base_crowds, gains_1N2, p_empirique_1D, alphas_isolement, V_horizon, stop_t=0):
+def solve_dp_with_full_empirical_distribution(base_true_probas, base_crowds, gains_1N2, p_empirique_1D, alphas_isolement, V_horizon, stop_t=0, horizon_nuit=0, start_t=-1):
+    """
+    start_t=-1  → run complet depuis n_matches-1, condition terminale appliquée.
+    start_t>=0  → run partiel depuis start_t-1 (phase proche), V_horizon utilisé tel quel
+                  comme condition limite fournie par un run lointain précédent.
+    """
     n_matches = base_true_probas.shape[0]
     max_gain = p_empirique_1D.shape[2]
-    
+
     V_all_matches = np.zeros((n_matches, GRID_SIZE, GRID_SIZE, 2), dtype=np.float32)
+    Q_tables = np.zeros((horizon_nuit, GRID_SIZE, GRID_SIZE, 3, 3), dtype=np.float32)
     V_next = np.copy(V_horizon)
 
-    # 1. Condition Terminale
-    for g1 in range(GRID_SIZE):
-        val_g1 = g1 - GAP_OFFSET
-        for g2 in range(g1, GRID_SIZE): 
-            val_g2 = g2 - GAP_OFFSET
-            
-            if val_g1 > 0 and val_g2 > 0: win_prob = 1.0
-            elif (val_g1 == 0 and val_g2 > 0) or (val_g1 > 0 and val_g2 == 0): win_prob = 0.5
-            elif val_g1 == 0 and val_g2 == 0: win_prob = 1.0 / 3.0
-            else: win_prob = 0.0
-                
-            V_next[g1, g2, 0] = win_prob
-            V_next[g1, g2, 1] = win_prob
+    # 1. Condition Terminale (uniquement pour run complet depuis le début)
+    if start_t < 0:
+        for g1 in range(GRID_SIZE):
+            val_g1 = g1 - GAP_OFFSET
+            for g2 in range(g1, GRID_SIZE):
+                val_g2 = g2 - GAP_OFFSET
 
-    # 2. Rétro-propagation
-    for t in range(n_matches - 1, stop_t - 1, -1):
+                if val_g1 > 0 and val_g2 > 0: win_prob = 1.0
+                elif (val_g1 == 0 and val_g2 > 0) or (val_g1 > 0 and val_g2 == 0): win_prob = 0.5
+                elif val_g1 == 0 and val_g2 == 0: win_prob = 1.0 / 3.0
+                else: win_prob = 0.0
+
+                V_next[g1, g2, 0] = win_prob
+                V_next[g1, g2, 1] = win_prob
+
+    # 2. Point de départ de la rétro-propagation
+    if start_t < 0:
+        t_debut = n_matches - 1
+    else:
+        t_debut = start_t - 1
+
+    # 3. Rétro-propagation
+    for t in range(t_debut, stop_t - 1, -1):
         V_current = np.zeros((GRID_SIZE, GRID_SIZE, 2), dtype=np.float32)
         t_prob = base_true_probas[t]
         c_rep = base_crowds[t]
         t_gains = gains_1N2[t]
-        alpha = alphas_isolement[t]  # <--- LECTURE DU GATING TEMPOREL
-        
+        alpha = alphas_isolement[t]
+        store_q = horizon_nuit > 0 and t >= stop_t and t < stop_t + horizon_nuit
+        k = t - stop_t
+
         for g1 in prange(GRID_SIZE):
             val_g1 = g1 - GAP_OFFSET
-            for g2 in range(g1, GRID_SIZE): 
+            for g2 in range(g1, GRID_SIZE):
                 val_g2 = g2 - GAP_OFFSET
-                
-                best_v_b0 = 0.0 
-                best_v_b1 = 0.0 
-                
+
+                best_v_b0 = 0.0
+                best_v_b1 = 0.0
+
                 for a in range(3):
                     expected_v_b0 = 0.0
                     expected_v_keep = 0.0
                     expected_v_use = 0.0
-                    
+
                     for out in range(3):
                         p_out = t_prob[out]
                         if p_out == 0.0: continue
-                        
+
                         a_g = t_gains[out] if a == out else 0
                         a_g_boost = (t_gains[out] * 2) if a == out else 0
                         true_gain = t_gains[out]
                         out_p_empirique = p_empirique_1D[t, out]
-                        
+
                         for bob_a in range(3):
                             p_bob = c_rep[bob_a]
                             if p_bob == 0.0: continue
-                            
+
                             bob_g = true_gain if bob_a == out else 0
                             jp_base = p_out * p_bob
-                            
+
                             new_gap_bob_norm = val_g1 + a_g - bob_g
                             new_gap_bob_boost = val_g1 + a_g_boost - bob_g
-                            
+
                             esp_peloton_b0 = 0.0
                             esp_peloton_keep = 0.0
                             esp_peloton_use = 0.0
-                            
+
                             for delta_gain in range(max_gain):
                                 p_peloton = out_p_empirique[delta_gain]
                                 if p_peloton == 0.0: continue
-                                    
+
                                 new_gap_peloton_norm = val_g2 + a_g - delta_gain
                                 new_gap_peloton_boost = val_g2 + a_g_boost - delta_gain
-                                
-                                # 🚀 TA FORMULE DE TRANSITION DE PHASE DE LA MEUTE 🚀
+
                                 val_g1_final_norm = min(new_gap_bob_norm, new_gap_peloton_norm)
                                 val_g2_final_norm = alpha * max(new_gap_bob_norm, new_gap_peloton_norm) + (1.0 - alpha) * new_gap_peloton_norm
-                                
+
                                 val_g1_final_boost = min(new_gap_bob_boost, new_gap_peloton_boost)
                                 val_g2_final_boost = alpha * max(new_gap_bob_boost, new_gap_peloton_boost) + (1.0 - alpha) * new_gap_peloton_boost
-                                
-                                # Arrondis et bornes
+
                                 g1_norm = max(GAP_MIN, min(GAP_MAX, int(round(val_g1_final_norm)))) + GAP_OFFSET
                                 g2_norm = max(GAP_MIN, min(GAP_MAX, int(round(val_g2_final_norm)))) + GAP_OFFSET
                                 g1_boost = max(GAP_MIN, min(GAP_MAX, int(round(val_g1_final_boost)))) + GAP_OFFSET
                                 g2_boost = max(GAP_MIN, min(GAP_MAX, int(round(val_g2_final_boost)))) + GAP_OFFSET
-                                
+
                                 esp_peloton_b0 += p_peloton * V_next[g1_norm, g2_norm, 0]
                                 esp_peloton_keep += p_peloton * V_next[g1_norm, g2_norm, 1]
                                 esp_peloton_use += p_peloton * V_next[g1_boost, g2_boost, 0]
-                                
+
                             expected_v_b0 += jp_base * esp_peloton_b0
                             expected_v_keep += jp_base * esp_peloton_keep
                             expected_v_use += jp_base * esp_peloton_use
 
+                    if store_q:
+                        Q_tables[k, g1, g2, a, 0] = expected_v_b0
+                        Q_tables[k, g1, g2, a, 1] = expected_v_keep
+                        Q_tables[k, g1, g2, a, 2] = expected_v_use
+
                     if expected_v_b0 > best_v_b0: best_v_b0 = expected_v_b0
                     best_action_b1 = max(expected_v_keep, expected_v_use)
                     if best_action_b1 > best_v_b1: best_v_b1 = best_action_b1
-                        
+
                 V_current[g1, g2, 0] = best_v_b0
                 V_current[g1, g2, 1] = best_v_b1
-                
+
         # Symétrie Safe
         for g1 in prange(GRID_SIZE):
             for g2 in range(g1 + 1, GRID_SIZE):
                 V_current[g2, g1, 0] = V_current[g1, g2, 0]
                 V_current[g2, g1, 1] = V_current[g1, g2, 1]
-                
+                if store_q:
+                    for a in range(3):
+                        Q_tables[k, g2, g1, a, 0] = Q_tables[k, g1, g2, a, 0]
+                        Q_tables[k, g2, g1, a, 1] = Q_tables[k, g1, g2, a, 1]
+                        Q_tables[k, g2, g1, a, 2] = Q_tables[k, g1, g2, a, 2]
+
         V_next = V_current
         V_all_matches[t] = V_current
-        
-    return V_all_matches
+
+    return V_all_matches, Q_tables
+
+
+@njit(parallel=True)
+def solve_dp_coarse(base_true_probas, base_crowds, gains_1N2, p_empirique_1D, alphas_isolement, V_horizon, stop_t=0, horizon_nuit=0, start_t=-1):
+    """
+    Version grille grossière (501×501, 2 pts/step) de solve_dp_with_full_empirical_distribution.
+    Couvre le même range [-600, +400] mais avec résolution 2 pts → 4× plus rapide
+    (moins d'états + V_next 2 MB au lieu de 8 MB → meilleure localité cache).
+
+    V_horizon doit être de shape (501, 501, 2)  ← downsampler depuis (1001, 1001, 2) avec [::2, ::2].
+    Retourne V_all_matches de shape (n_matches, 501, 501, 2).
+
+    Convention : val_g = g - 300  représente le gap en "demi-points".
+    Tous les gains sont divisés par 2 pour rester dans cet espace.
+    start_t=-1  → run complet depuis n_matches-1, condition terminale appliquée.
+    start_t>=0  → run partiel depuis start_t-1, V_horizon utilisé tel quel.
+    """
+    n_matches = base_true_probas.shape[0]
+    max_gain = p_empirique_1D.shape[2]
+
+    V_all_matches = np.zeros((n_matches, 501, 501, 2), dtype=np.float32)
+    Q_tables = np.zeros((horizon_nuit, 501, 501, 3, 3), dtype=np.float32)
+    V_next = np.copy(V_horizon)
+
+    # 1. Condition Terminale (uniquement pour run complet depuis le début)
+    if start_t < 0:
+        for g1 in range(501):  # En dur pour la rapidité de Numba
+            val_g1 = g1 - 300
+            for g2 in range(g1, 501):  # En dur pour la rapidité de Numba
+                val_g2 = g2 - 300
+
+                if val_g1 > 0 and val_g2 > 0: win_prob = 1.0
+                elif (val_g1 == 0 and val_g2 > 0) or (val_g1 > 0 and val_g2 == 0): win_prob = 0.5
+                elif val_g1 == 0 and val_g2 == 0: win_prob = 1.0 / 3.0
+                else: win_prob = 0.0
+
+                V_next[g1, g2, 0] = win_prob
+                V_next[g1, g2, 1] = win_prob
+
+    # 2. Point de départ de la rétro-propagation
+    if start_t < 0:
+        t_debut = n_matches - 1
+    else:
+        t_debut = start_t - 1
+
+    # 3. Rétro-propagation
+    for t in range(t_debut, stop_t - 1, -1):
+        V_current = np.zeros((501, 501, 2), dtype=np.float32)  # En dur pour la rapidité de Numba
+        t_prob = base_true_probas[t]
+        c_rep = base_crowds[t]
+        t_gains = gains_1N2[t]
+        alpha = alphas_isolement[t]
+        store_q = horizon_nuit > 0 and t >= stop_t and t < stop_t + horizon_nuit
+        k = t - stop_t
+
+        for g1 in prange(501):  # En dur pour la rapidité de Numba
+            val_g1 = g1 - 300   # Demi-points (= gap réel / 2)
+            for g2 in range(g1, 501):  # En dur pour la rapidité de Numba
+                val_g2 = g2 - 300
+
+                best_v_b0 = 0.0
+                best_v_b1 = 0.0
+
+                for a in range(3):
+                    expected_v_b0 = 0.0
+                    expected_v_keep = 0.0
+                    expected_v_use = 0.0
+
+                    for out in range(3):
+                        p_out = t_prob[out]
+                        if p_out == 0.0: continue
+
+                        # Gains divisés par 2 pour rester dans l'espace coarse (demi-points)
+                        a_g       = (t_gains[out] / 2.0) if a == out else 0.0
+                        a_g_boost = float(t_gains[out])  if a == out else 0.0  # = 2 × a_g
+                        true_gain = t_gains[out] / 2.0
+                        out_p_empirique = p_empirique_1D[t, out]
+
+                        for bob_a in range(3):
+                            p_bob = c_rep[bob_a]
+                            if p_bob == 0.0: continue
+
+                            bob_g = true_gain if bob_a == out else 0.0
+                            jp_base = p_out * p_bob
+
+                            new_gap_bob_norm  = val_g1 + a_g       - bob_g
+                            new_gap_bob_boost = val_g1 + a_g_boost - bob_g
+
+                            esp_peloton_b0   = 0.0
+                            esp_peloton_keep = 0.0
+                            esp_peloton_use  = 0.0
+
+                            for delta_gain in range(max_gain):
+                                p_peloton = out_p_empirique[delta_gain]
+                                if p_peloton == 0.0: continue
+
+                                dg_c = delta_gain / 2.0  # delta_gain divisé par 2 (espace coarse)
+                                new_gap_peloton_norm  = val_g2 + a_g       - dg_c
+                                new_gap_peloton_boost = val_g2 + a_g_boost - dg_c
+
+                                val_g1_final_norm  = min(new_gap_bob_norm,  new_gap_peloton_norm)
+                                val_g2_final_norm  = alpha * max(new_gap_bob_norm,  new_gap_peloton_norm) + (1.0 - alpha) * new_gap_peloton_norm
+
+                                val_g1_final_boost = min(new_gap_bob_boost, new_gap_peloton_boost)
+                                val_g2_final_boost = alpha * max(new_gap_bob_boost, new_gap_peloton_boost) + (1.0 - alpha) * new_gap_peloton_boost
+
+                                # Clampage dans [0, 500] (grille 501)
+                                g1_norm  = max(0, min(500, int(round(val_g1_final_norm))  + 300))
+                                g2_norm  = max(0, min(500, int(round(val_g2_final_norm))  + 300))
+                                g1_boost = max(0, min(500, int(round(val_g1_final_boost)) + 300))
+                                g2_boost = max(0, min(500, int(round(val_g2_final_boost)) + 300))
+
+                                esp_peloton_b0   += p_peloton * V_next[g1_norm,  g2_norm,  0]
+                                esp_peloton_keep += p_peloton * V_next[g1_norm,  g2_norm,  1]
+                                esp_peloton_use  += p_peloton * V_next[g1_boost, g2_boost, 0]
+
+                            expected_v_b0   += jp_base * esp_peloton_b0
+                            expected_v_keep += jp_base * esp_peloton_keep
+                            expected_v_use  += jp_base * esp_peloton_use
+
+                    if store_q:
+                        Q_tables[k, g1, g2, a, 0] = expected_v_b0
+                        Q_tables[k, g1, g2, a, 1] = expected_v_keep
+                        Q_tables[k, g1, g2, a, 2] = expected_v_use
+
+                    if expected_v_b0 > best_v_b0: best_v_b0 = expected_v_b0
+                    best_action_b1 = max(expected_v_keep, expected_v_use)
+                    if best_action_b1 > best_v_b1: best_v_b1 = best_action_b1
+
+                V_current[g1, g2, 0] = best_v_b0
+                V_current[g1, g2, 1] = best_v_b1
+
+        # Symétrie Safe (triangle inférieur)
+        for g1 in prange(501):  # En dur pour la rapidité de Numba
+            for g2 in range(g1 + 1, 501):
+                V_current[g2, g1, 0] = V_current[g1, g2, 0]
+                V_current[g2, g1, 1] = V_current[g1, g2, 1]
+                if store_q:
+                    for a in range(3):
+                        Q_tables[k, g2, g1, a, 0] = Q_tables[k, g1, g2, a, 0]
+                        Q_tables[k, g2, g1, a, 1] = Q_tables[k, g1, g2, a, 1]
+                        Q_tables[k, g2, g1, a, 2] = Q_tables[k, g1, g2, a, 2]
+
+        V_next = V_current
+        V_all_matches[t] = V_current
+
+    return V_all_matches, Q_tables
 
 
 @njit(parallel=True)

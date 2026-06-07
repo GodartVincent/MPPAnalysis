@@ -2,6 +2,8 @@
 Core logic and utility functions for the MonPetitProno (MPP) analysis project.
 """
 
+import warnings
+
 import pandas as pd
 import numpy as np
 import unicodedata
@@ -58,13 +60,33 @@ def calculate_true_outcome_probas_from_odds(odds: np.ndarray) -> np.ndarray:
     inv_odds = 1.0 / odds_array
     
     # 2. Somme par ligne (par match)
-    # Si le tableau a une seule dimension (ex: un seul match [2.0, 3.0, 3.0]), 
+    # Si le tableau a une seule dimension (ex: un seul match [2.0, 3.0, 3.0]),
     # sum() s'applique normalement. Si c'est 2D (N, 3), on utilise axis=1.
     if inv_odds.ndim == 2:
         total_inv_odds = np.sum(inv_odds, axis=1, keepdims=True)
     else:
         total_inv_odds = np.sum(inv_odds)
-        
+
+    # 2bis. Garde-fou : la somme des probabilités implicites (1/cote) vaut
+    # 1 + marge bookmaker. Une marge NÉGATIVE (somme < 1) est impossible pour un
+    # vrai book (ce serait une opportunité d'arbitrage) -> faute de saisie probable.
+    _sums = np.atleast_1d(total_inv_odds).ravel()
+    for i, s in enumerate(_sums):
+        if s <= 0.0:
+            continue
+        if s < 1.0 - 1e-9:
+            warnings.warn(
+                f"Cotes match index {i}: somme(1/cote)={s:.4f} < 1 "
+                f"(marge bookmaker négative, impossible). Vérifier la saisie CSV.",
+                stacklevel=2,
+            )
+        elif s > 1.15:
+            warnings.warn(
+                f"Cotes match index {i}: somme(1/cote)={s:.4f} > 1.15 "
+                f"(marge bookmaker excessive, cote probablement mal saisie).",
+                stacklevel=2,
+            )
+
     # 3. Sécurité contre la division par zéro
     # np.where est très puissant pour faire des conditions sans boucle for
     safe_total = np.where(total_inv_odds == 0, 1.0, total_inv_odds)
@@ -365,6 +387,127 @@ def calculate_mpp_gains(
     return np.round(gains).astype(int)
 
 # --- FONCTIONS LIÉES AU MODÈLE DE FOULE (CROWD) ---
+def normalize_crowds(raw_crowds, tol=0.01, label="match", warn=True):
+    """
+    Normalise les répartitions de foule par ligne (somme = 1).
+
+    Deux usages :
+      - warn=True (lecture CSV) : alerte si la somme brute sort de [1-tol, 1+tol].
+        Les crowds du CSV sont saisis à 1e-2 près, donc une somme de 0.99/1.01 par
+        arrondi est tolérée ; au-delà c'est probablement une faute de saisie.
+      - warn=False (mode silencieux) : pour renormaliser des crowds dérivés en
+        interne (formule true_probas -> crowd, bruit hétéroscédastique), où une
+        somme éloignée de 1 avant renormalisation est NORMALE et non une anomalie.
+
+    NB : apply_heteroscedastic_noise et estimate_crowd_3D renormalisent déjà
+    en interne (sans passer par cette fonction), donc le chemin drift est couvert.
+
+    Accepte un tableau (N, 3) ou (3,) ; renvoie toujours du (N, 3) float64.
+    """
+    raw = np.asarray(raw_crowds, dtype=np.float64)
+    if raw.ndim == 1:
+        raw = raw[None, :]
+    sums = raw.sum(axis=1)
+    if warn:
+        for i in np.where((sums < 1.0 - tol) | (sums > 1.0 + tol))[0]:
+            warnings.warn(
+                f"Crowd {label} index {i}: somme={sums[i]:.4f} hors "
+                f"[{1.0 - tol:.2f}, {1.0 + tol:.2f}] (valeurs={raw[i]}). "
+                f"Vérifier la saisie CSV.",
+                stacklevel=2,
+            )
+    safe = np.where(sums == 0.0, 1.0, sums)
+    return raw / safe[:, None]
+
+
+EXPECTED_PHASES = {
+    "Poule_J1", "Poule_J2", "Poule_J3", "16e", "8e", "quart", "demi", "finale",
+}
+
+
+def validate_match_dataframe(df, gain_min=14.0, gain_max=250.0):
+    """
+    Émet des warnings pour les anomalies de saisie probables dans le CSV des matchs.
+    N'altère pas le DataFrame ; les colonnes absentes sont simplement ignorées.
+
+    Contrôles :
+      - 'phase' hors de l'ensemble attendu (EXPECTED_PHASES) ;
+      - gain MPP aberrant (< gain_min ou > gain_max) ;
+      - équipe (team_A / team_B) n'apparaissant qu'une seule fois dans tout le
+        fichier (faute d'orthographe probable).
+    """
+    # 1. Phases inattendues
+    if "phase" in df.columns:
+        unknown = set(df["phase"].dropna().unique()) - EXPECTED_PHASES
+        if unknown:
+            warnings.warn(
+                f"Phase(s) inattendue(s) dans le CSV : {sorted(unknown)}. "
+                f"Attendu un sous-ensemble de {sorted(EXPECTED_PHASES)}.",
+                stacklevel=2,
+            )
+
+    # 2. Gains MPP aberrants
+    gain_cols = [c for c in ("gain_mpp_1", "gain_mpp_N", "gain_mpp_2") if c in df.columns]
+    if gain_cols:
+        g = df[gain_cols].to_numpy(dtype=float)
+        for r, c in np.argwhere((g < gain_min) | (g > gain_max)):
+            warnings.warn(
+                f"Gain MPP aberrant ligne {int(r)}, '{gain_cols[c]}'={g[r, c]:.0f} "
+                f"(hors [{gain_min:.0f}, {gain_max:.0f}]).",
+                stacklevel=2,
+            )
+
+    # 3. Équipe n'apparaissant qu'une seule fois (faute d'orthographe probable)
+    team_cols = [c for c in ("team_A", "team_B") if c in df.columns]
+    if team_cols:
+        noms = pd.concat([df[c] for c in team_cols], ignore_index=True).dropna()
+        counts = noms.value_counts()
+        for nom in counts[counts == 1].index.tolist():
+            warnings.warn(
+                f"Équipe '{nom}' n'apparaît qu'une seule fois dans le CSV "
+                f"(faute d'orthographe ?).",
+                stacklevel=2,
+            )
+
+
+def validate_team_consistency(df_matches, df_group_odds=None, df_market=None, min_apparitions=3):
+    """
+    Vérifie la cohérence des noms d'équipes ENTRE fichiers (faute d'orthographe).
+
+    Comparaison insensible à la casse / aux espaces (comme bracket_simulator).
+
+    - Chaque équipe de df_group_odds['team'] doit apparaître >= min_apparitions
+      fois dans df_matches (team_A/team_B) : en poules chaque équipe joue 3 matchs.
+    - Chaque 'favorite' de df_market (category == 'favorite') doit aussi y figurer.
+      Les 'scorer' sont des JOUEURS -> ignorés. Il est NORMAL que toutes les équipes
+      ne soient pas dans df_market : les gros outsiders sont volontairement omis
+      (cotes abaissées par les bookmakers -> sur-normalisation). Le contrôle est
+      donc à sens unique (market -> matchs), jamais l'inverse.
+    """
+    if df_matches is None or not {"team_A", "team_B"} <= set(df_matches.columns):
+        return
+    counts = (
+        pd.concat([df_matches["team_A"], df_matches["team_B"]], ignore_index=True)
+        .dropna().astype(str).str.strip().str.lower().value_counts()
+    )
+
+    def _check(names, source):
+        for nom in names:
+            n = int(counts.get(str(nom).strip().lower(), 0))
+            if n < min_apparitions:
+                warnings.warn(
+                    f"Équipe '{nom}' ({source}) apparaît {n}x dans le CSV des matchs "
+                    f"(attendu >= {min_apparitions}). Incohérence / faute d'orthographe ?",
+                    stacklevel=2,
+                )
+
+    if df_group_odds is not None and "team" in df_group_odds.columns:
+        _check(df_group_odds["team"].dropna(), "group_stage_odds")
+    if df_market is not None and {"category", "selection"} <= set(df_market.columns):
+        favs = df_market.loc[df_market["category"] == "favorite", "selection"].dropna()
+        _check(favs, "favorite")
+
+
 def apply_heteroscedastic_noise(crowds, rmse=0.083):
     """
     Applique un bruit hétéroscédastique (variance max à 0.5) sur une matrice de probabilités.
