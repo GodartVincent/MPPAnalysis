@@ -165,12 +165,14 @@ def build_terminal_state_with_variance(
 def solve_endgame_dp(match_probs, crowds, gains_1N2, p_empirique_1D, alphas, 
                      my_fav_roles, bob_fav_roles, pack_fav_roles, V_terminal, stop_t=0):
     
-    n_matches = match_probs.shape[0]
     max_gain = p_empirique_1D.shape[2]
+    
+    # Historique complet 7D
+    V_history = np.zeros((32, 501, 501, 2, 2, 2, 2), dtype=np.float32)
     V_next = V_terminal
     
     for t in range(31, stop_t - 1, -1):
-        V_current = np.zeros((GRID_SIZE, GRID_SIZE, 2, 2, 2, 2), dtype=np.float32)
+        V_current = np.zeros((501, 501, 2, 2, 2, 2), dtype=np.float32)
         
         t_prob = match_probs[t]
         c_rep = crowds[t]
@@ -181,41 +183,57 @@ def solve_endgame_dp(match_probs, crowds, gains_1N2, p_empirique_1D, alphas,
         bob_r = bob_fav_roles[t]
         pack_r = pack_fav_roles[t]
         
-        for g1 in prange(GRID_SIZE):
-            val_g1 = g1 - GAP_OFFSET
-            for g2 in range(g1, GRID_SIZE):
-                val_g2 = g2 - GAP_OFFSET
+        for g1 in prange(501): # En dur pour la rapidité de numba
+            # ==============================================================
+            # OPTIMISATION EXTRÊME : Allocation "Thread-Local" UNE SEULE FOIS
+            # ==============================================================
+            best_wr_b1 = np.zeros((2, 2, 2), dtype=np.float32)
+            best_wr_b0 = np.zeros((2, 2, 2), dtype=np.float32)
+            
+            exp_keep = np.zeros((2, 2, 2), dtype=np.float32)
+            exp_use  = np.zeros((2, 2, 2), dtype=np.float32)
+            exp_b0   = np.zeros((2, 2, 2), dtype=np.float32)
+            
+            next_my_A = np.zeros(2, dtype=np.int32)
+            next_my_B = np.zeros(2, dtype=np.int32)
+            next_bob_A = np.zeros(2, dtype=np.int32)
+            next_bob_B = np.zeros(2, dtype=np.int32)
+            next_pack_A = np.zeros(2, dtype=np.int32)
+            next_pack_B = np.zeros(2, dtype=np.int32)
+            # ==============================================================
+            
+            val_g1 = g1 - 300 # GAP_OFFSET
+            for g2 in range(501): # En dur pour la rapidité de numba
+                val_g2 = g2 - 300
                 
-                best_wr_b1 = np.zeros((2, 2, 2), dtype=np.float32)
-                best_wr_b0 = np.zeros((2, 2, 2), dtype=np.float32)
+                # On recycle la mémoire ! (Très rapide)
+                best_wr_b1.fill(0.0)
+                best_wr_b0.fill(0.0)
                 
                 for a in range(3):
-                    exp_keep = np.zeros((2, 2, 2), dtype=np.float32)
-                    exp_use  = np.zeros((2, 2, 2), dtype=np.float32)
-                    exp_b0   = np.zeros((2, 2, 2), dtype=np.float32)
+                    # On recycle les accumulateurs d'espérance
+                    exp_keep.fill(0.0)
+                    exp_use.fill(0.0)
+                    exp_b0.fill(0.0)
                     
                     for out in range(3):
                         p_out = t_prob[out]
                         if p_out == 0.0: continue
                         
-                        # ECHELLE / 2.0 (Le boost x2 devient un x1, le base devient 0.5)
                         a_g = (t_gains[out] / 2.0) if a == out else 0
                         a_g_boost = float(t_gains[out]) if a == out else 0
                         true_gain = t_gains[out] / 2.0
                         
                         out_p_empirique = p_empirique_1D[t, out]
                         
-                        # Calcul Survivants
-                        next_my_A = np.zeros(2, dtype=np.int32); next_my_B = np.zeros(2, dtype=np.int32)
-                        next_bob_A = np.zeros(2, dtype=np.int32); next_bob_B = np.zeros(2, dtype=np.int32)
-                        next_pack_A = np.zeros(2, dtype=np.int32); next_pack_B = np.zeros(2, dtype=np.int32)
-                        
                         for f in range(2):
                             if out != 1:
                                 next_my_A[f] = 1 if out == my_r else (0 if my_r != -1 else f)
                                 next_bob_A[f] = 1 if out == bob_r else (0 if bob_r != -1 else f)
                                 next_pack_A[f] = 1 if out == pack_r else (0 if pack_r != -1 else f)
-                                next_my_B[f] = next_my_A[f]; next_bob_B[f] = next_bob_A[f]; next_pack_B[f] = next_pack_A[f]
+                                next_my_B[f] = next_my_A[f]
+                                next_bob_B[f] = next_bob_A[f]
+                                next_pack_B[f] = next_pack_A[f]
                             else:
                                 next_my_A[f] = 1 if my_r == 0 else (0 if my_r == 2 else f)
                                 next_my_B[f] = 1 if my_r == 2 else (0 if my_r == 0 else f)
@@ -239,8 +257,7 @@ def solve_endgame_dp(match_probs, crowds, gains_1N2, p_empirique_1D, alphas,
                                 if p_peloton == 0.0: continue
                                 
                                 weight = jp_base * p_peloton
-                                
-                                delta_scaled = delta_gain / 2.0 # ECHELLE / 2.0
+                                delta_scaled = delta_gain / 2.0 
                                 
                                 new_g2_k = val_g2 + a_g - delta_scaled
                                 new_g2_u = val_g2 + a_g_boost - delta_scaled
@@ -250,10 +267,10 @@ def solve_endgame_dp(match_probs, crowds, gains_1N2, p_empirique_1D, alphas,
                                 val_g1_f_u = min(new_g1_u, new_g2_u)
                                 val_g2_f_u = alpha * max(new_g1_u, new_g2_u) + (1.0 - alpha) * new_g2_u
                                 
-                                idx_g1_k = max(0, min(GRID_SIZE - 1, int(round(val_g1_f_k)) + GAP_OFFSET))
-                                idx_g2_k = max(0, min(GRID_SIZE - 1, int(round(val_g2_f_k)) + GAP_OFFSET))
-                                idx_g1_u = max(0, min(GRID_SIZE - 1, int(round(val_g1_f_u)) + GAP_OFFSET))
-                                idx_g2_u = max(0, min(GRID_SIZE - 1, int(round(val_g2_f_u)) + GAP_OFFSET))
+                                idx_g1_k = max(0, min(500, int(round(val_g1_f_k)) + 300))
+                                idx_g2_k = max(0, min(500, int(round(val_g2_f_k)) + 300))
+                                idx_g1_u = max(0, min(500, int(round(val_g1_f_u)) + 300))
+                                idx_g2_u = max(0, min(500, int(round(val_g2_f_u)) + 300))
                                 
                                 for my_f in range(2):
                                     nmA = next_my_A[my_f]; nmB = next_my_B[my_f]
@@ -291,14 +308,7 @@ def solve_endgame_dp(match_probs, crowds, gains_1N2, p_empirique_1D, alphas,
                             V_current[g1, g2, 0, my_f, bob_f, pack_f] = best_wr_b0[my_f, bob_f, pack_f]
                             V_current[g1, g2, 1, my_f, bob_f, pack_f] = best_wr_b1[my_f, bob_f, pack_f]
                             
-        for g1 in prange(GRID_SIZE):
-            for g2 in range(g1 + 1, GRID_SIZE):
-                for my_f in range(2):
-                    for bob_f in range(2):
-                        for pack_f in range(2):
-                            V_current[g2, g1, 0, my_f, bob_f, pack_f] = V_current[g1, g2, 0, my_f, bob_f, pack_f]
-                            V_current[g2, g1, 1, my_f, bob_f, pack_f] = V_current[g1, g2, 1, my_f, bob_f, pack_f]
-                            
         V_next = V_current
+        V_history[t] = V_current.copy()
         
-    return V_next
+    return V_history

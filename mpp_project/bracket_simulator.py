@@ -8,8 +8,8 @@ import sys
 # --- IMPORTS DU PROJET ---
 from mpp_project.core import MAX_TRUE_PROBA, MIN_TRUE_PROBA, apply_temporal_drift, estimate_crowd_3D, calculate_mpp_gains, calculate_true_outcome_probas_from_odds
 # On importe le solveur qu'on a codé précédemment
-from mpp_project.v5_supervised.end_game_solver import solve_endgame_dp, build_terminal_state
-from mpp_project.v5_supervised.oracle_dp import estimate_mpp_crowd, rescale_histogram_1D
+from mpp_project.end_game_solver import solve_endgame_dp, build_terminal_state
+from mpp_project.oracle_dp import estimate_mpp_crowd, rescale_histogram_1D, extract_peloton_full_distribution
 
 # ==========================================
 # 1. PARSING ET PRÉPARATION DES DONNÉES
@@ -108,7 +108,6 @@ def precompute_diluted_peloton(df_poules, df_odds_finales, n_brackets=10, n_runs
     full_crowds_3d = np.expand_dims(full_crowds, axis=0)
     
     # 4. Monte-Carlo Numba
-    from mpp_project.v5_supervised.oracle_dp import extract_peloton_full_distribution
     p_empirique_104 = extract_peloton_full_distribution(
         true_probas_3d=full_probas_3d,
         crowds_3d=full_crowds_3d,
@@ -353,23 +352,37 @@ def compute_robust_endgame_horizon(my_fav, my_scorer, path_poules="data/CDM_2026
         # Bien que nommée df_poules historiquement, elle contient tout le tournoi (CDM_2026.csv)
         df_poules = pd.read_csv(path_poules)
     except FileNotFoundError:
-        print(f"⚠️ Fichier {path_poules} introuvable. L'inertie du peloton risque d'être faussée.")
+        print(f"Fichier {path_poules} introuvable. L'inertie du peloton risque d'être faussée.")
         return
         
-    # --- DÉTECTION DU MODE : AVANT-TOURNOI ou HORIZON GLISSANT ---
+    # --- DÉTECTION DU MODE (Le "GPS" du tournoi) ---
     mask_pf = df_poules['phase'].str.contains('16e|8e|Quart|Demi|Finale', na=False)
     df_pf = df_poules[mask_pf].reset_index(drop=True)
     
+    # 1. Combien de résultats de PF sont déjà connus ?
     if 'result' in df_pf.columns:
-        matchs_joues = df_pf[df_pf['result'].notna() & (df_pf['result'] != '')]
+        # On sécurise la lecture pour éviter les 'nan' ou espaces vides
+        matchs_joues = df_pf[df_pf['result'].notna() & 
+                             (df_pf['result'].astype(str).str.strip() != '') & 
+                             (df_pf['result'].astype(str).str.lower() != 'nan')]
         match_idx_pf = len(matchs_joues)
     else:
         match_idx_pf = 0
 
+    # 2. Les affiches des 16èmes sont-elles renseignées ?
+    affiches_16e_connues = False
+    if not df_pf.empty:
+        premier_16e_team_A = str(df_pf.iloc[0].get('team_A', '')).strip().lower()
+        if premier_16e_team_A != 'nan' and premier_16e_team_A != '':
+            affiches_16e_connues = True
+
+    # 3. Affichage du vrai statut
     if match_idx_pf > 0:
-        print(f"🌍 MODE HORIZON GLISSANT : {match_idx_pf} matchs de phases finales déjà validés.")
+        print(f"MODE HORIZON GLISSANT : {match_idx_pf} matchs de phases finales déjà validés.")
+    elif affiches_16e_connues:
+        print(f"MODE HORIZON GLISSANT : Début des 16èmes de finale (Affiches connues, 0 match terminé).")
     else:
-        print(f"🌍 MODE AVANT-TOURNOI : Pré-calcul depuis la fin des poules.")
+        print(f"MODE AVANT-TOURNOI : Pré-calcul complet depuis la fin des poules.")
     
     fav_names = df_fav['selection'].tolist()
     fav_probs = df_fav['estimated_crowd'].values
@@ -495,7 +508,7 @@ def compute_robust_endgame_horizon(my_fav, my_scorer, path_poules="data/CDM_2026
                 V_start_1001[:, g1, g2] = V_final[:, idx1, idx2]
                 
     np.save("data/expected_V_phases_finales_full.npy", V_start_1001)
-    print(f"✅ EXPORT RÉUSSI : data/expected_V_phases_finales_full.npy (Forme: {V_start_1001.shape})")
+    print(f"EXPORT RÉUSSI : data/expected_V_phases_finales_full.npy (Forme: {V_start_1001.shape})")
 
 if __name__ == "__main__":
     # Test avec 15 arbres pour être rapide au quotidien (Modifiable le Jour J)

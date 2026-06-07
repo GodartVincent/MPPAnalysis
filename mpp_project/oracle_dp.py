@@ -3,8 +3,6 @@ import time
 from numba import njit, prange
 
 # --- IMPORTS DE TON PROJET ---
-from mpp_project.mpp_env import MppEnv
-from mpp_project.strategies import strat_noisy_typical_opponent
 from mpp_project.core import RMSE_GAINS, apply_heteroscedastic_noise, apply_temporal_drift, estimate_crowd_3D, calculate_mpp_gains
 
 # --- 1. CONFIGURATION & CONSTANTES ---
@@ -32,10 +30,10 @@ match_params = {
 }
 
 @njit
-def compute_alphas_isolement(true_probas, crowds, gains_1N2, seuil_isolement=120.0):
+def compute_alphas_isolement(true_probas, crowds, gains_1N2, seuil_isolement=80.0):
     """
-    Calcule le facteur d'isolement (alpha) de 0.0 (Début/Meute dense) à 1.0 (Fin/Joueurs isolés)
-    basé sur l'écart-type cumulé réel des gains.
+    Calcule le facteur d'isolement (alpha) au sein du peloton de 0.0 (Début/Meute dense)
+    à 1.0 (Fin/Joueurs isolés) basé sur l'écart-type cumulé réel des gains des adversaires.
     """
     n_matches = true_probas.shape[0]
     alphas = np.zeros(n_matches, dtype=np.float32)
@@ -91,37 +89,7 @@ def estimate_mpp_crowd(selections, true_probs, gains, base_beta=1.2):
     final_weights = crowd_weights * chauvinism_multiplier
     return final_weights / final_weights.sum()
 
-def generate_tournament_environment(env_config=None):
-    """
-    Génère un tournoi complet. Nous utiliserons les 32 derniers matchs.
-    """
-    if env_config is None:
-        env_config = {}
-        
-    env = MppEnv(n_players=N_PLAYERS, n_matches=N_MATCHES, match_params=match_params,
-                 num_random_opponents=0, 
-                 use_domain_randomization=False,
-                 use_winner_reward=False)
-    env.reset()
-    env._generate_tournament()
-    
-    true_probas = env.outcome_probas 
-    mpp_gains = env.match_gains
-    mpp_probas = env.outcome_probas 
-    
-    # Appel de ta stratégie pour récupérer la matrice (104, 3) bruitée
-    crowd_repartitions = strat_noisy_typical_opponent(
-        [], [], 
-        mpp_probas=mpp_probas, 
-        opp_repartition=env.opp_repartition, 
-        player_scores=None, 
-        my_idx=0
-    )
-    
-    return true_probas, mpp_probas, mpp_gains, crowd_repartitions
-
 # --- 2. L'ORACLE C++ (NUMBA) ---
-# 2. Ajout du paramètre parallel=True
 @njit(parallel=True)
 def solve_final_phases_numba(true_probas, mpp_gains, crowd_repartitions):
     V_all_matches = np.zeros((N_MATCHES_FINALES, GRID_SIZE, GRID_SIZE, 2), dtype=np.float32)
@@ -232,7 +200,7 @@ def solve_final_phases_numba(true_probas, mpp_gains, crowd_repartitions):
     return V_all_matches
 
 
-# --- 2. FONCTION D'INFÉRENCE LOCALE (Notebook 10) ---
+# --- 3. FONCTION D'INFÉRENCE LOCALE (Notebook 10) ---
 @njit(parallel=True)
 def evaluate_current_match(match_idx_to_predict, last_csv_idx, probas, gains, crowds, V_horizon, gap1, gap2, has_booster):
     V_next = np.copy(V_horizon)
@@ -383,7 +351,7 @@ def evaluate_current_match(match_idx_to_predict, last_csv_idx, probas, gains, cr
             
     return wr_keep, wr_use, ev_actions
 
-# --- 3. CALCUL DE L'ESPÉRANCE (MONTE CARLO) ---
+# --- 4. CALCUL DE L'ESPÉRANCE DE WIN RATE DE L'AGENT A L'HORIZON (MONTE CARLO) ---
 def compute_expected_V_phases_finales(n_simulations=5000):
     print(f"--- DÉMARRAGE DU CALCUL MONTE CARLO ({n_simulations} simulations) ---")
     
@@ -414,7 +382,7 @@ def compute_expected_V_phases_finales(n_simulations=5000):
     
     print(f"\n✅ CALCUL TERMINÉ EN {time.time() - start_time:.1f}s")
 
-
+# Batching pour calculer plusieurs drift et moyenner les win rates résultants pour lisser les résultats et réduire la variance de l'estimation.
 def evaluate_match_ensemble(match_idx, last_csv_match_id, true_probas, match_phases, mpp_gains, crowd_repartitions, V_next_base, gap1, gap2, has_booster, n_ensembles=30):
     """
     Inférence locale Monte Carlo avec Lissage Bayésien Temporel (Alpha)
