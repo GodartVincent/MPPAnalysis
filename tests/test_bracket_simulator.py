@@ -13,6 +13,7 @@ from mpp_project.bracket_simulator import (
     simulate_group_stages,
     generate_bracket_scenario,
     poules_horizon_from_full,
+    conditional_matchup_prob,
 )
 from tests.helpers import DATA_DIR
 
@@ -145,3 +146,28 @@ def test_poules_horizon_6d_ajoute_axe_match():
     out = poules_horizon_from_full(full)
     assert out.shape == (1, 6, 6, 2)
     assert np.allclose(out[0], 0.7)
+
+
+# ---------------------------------------------------------------------------
+# conditional_matchup_prob : force conditionnelle cv_inv / surv
+# ---------------------------------------------------------------------------
+def test_matchup_egalite():
+    # Forces et survies identiques -> 50/50
+    assert conditional_matchup_prob(0.10, 0.5, 0.10, 0.5) == pytest.approx(0.5)
+
+
+def test_matchup_sans_conditionnement_est_le_ratio_brut():
+    # surv = 1 des deux côtés -> simple ratio des cv_inv (= comportement historique)
+    assert conditional_matchup_prob(0.05, 1.0, 0.15, 1.0) == pytest.approx(0.25)
+
+
+def test_matchup_boost_apres_avoir_battu_un_cador():
+    """
+    A (outsider, cv_inv=0.05) a battu de gros morceaux -> faible survie (0.2).
+    B (favori, cv_inv=0.15) a croisé -> survie élevée (0.8).
+    La force conditionnelle de A grimpe : il devient même favori du match.
+    """
+    p_brut = conditional_matchup_prob(0.05, 1.0, 0.15, 1.0)   # 0.25
+    p_cond = conditional_matchup_prob(0.05, 0.2, 0.15, 0.8)
+    assert p_cond > p_brut
+    assert p_cond > 0.5

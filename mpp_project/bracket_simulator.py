@@ -248,6 +248,25 @@ def poules_horizon_from_full(V_full):
         V = V[None, ...]
     return V
 
+def conditional_matchup_prob(cv_inv_a, surv_a, cv_inv_b, surv_b, eps=1e-6):
+    """
+    Probabilité que l'équipe A batte B dans un match knockout, à partir de leurs
+    FORCES CONDITIONNELLES plutôt que du simple ratio des cotes de victoire finale.
+
+    Force conditionnelle = P(victoire finale | tour atteint) = cv_inv / surv, où
+      cv_inv = 1 / cote_victoire (prob a priori de gagner le tournoi, avant poules)
+      surv   = P(atteindre ce tour) = (1/cote_qualif) puis × probas des matchs franchis.
+
+    Conditionner par la survie fait monter la force d'une équipe qui a déjà éliminé
+    de gros morceaux (faible surv -> ratio cv/surv élevé), sous hypothèse
+    d'indépendance des matchs.
+    """
+    s_a = cv_inv_a / max(surv_a, eps)
+    s_b = cv_inv_b / max(surv_b, eps)
+    total = s_a + s_b
+    return 0.5 if total <= 0.0 else s_a / total
+
+
 def generate_bracket_scenario(df_odds, df_tournoi=None):
     """
     Simulateur Universel (Avant-tournoi & Horizon Glissant).
@@ -257,9 +276,14 @@ def generate_bracket_scenario(df_odds, df_tournoi=None):
     # 1. Simulation pure des poules (Le Brouillon Monte-Carlo)
     q1, q2, q3 = simulate_group_stages(df_odds)
     
-    bracket_teams = np.full((32, 2), -1, dtype=np.int32) 
+    bracket_teams = np.full((32, 2), -1, dtype=np.int32)
     team_to_id = {str(row['team']).strip().lower(): i for i, row in df_odds.iterrows()}
     id_to_odds = {i: 1.0 / row['cote_victoire'] for i, row in df_odds.iterrows()}
+
+    # Survie : P(atteindre le tour courant). Initialisée à P(qualifié en 16e) = 1/cote_qualif,
+    # car cote_victoire est une probabilité AVANT poules (elle inclut la qualification).
+    # Mise à jour après chaque match franchi (cf. boucle ci-dessous).
+    surv = {i: 1.0 / row['cote_qualif'] for i, row in df_odds.iterrows()}
     
     # --- PLACEMENT DES QUALIFIÉS MONTE-CARLO ---
     for q in q1 + q2:
@@ -326,8 +350,14 @@ def generate_bracket_scenario(df_odds, df_tournoi=None):
         t1, t2 = bracket_teams[m, 0], bracket_teams[m, 1]
         match_teams[m, 0], match_teams[m, 1] = t1, t2
         
-        o1, o2 = id_to_odds.get(t1, 50.0), id_to_odds.get(t2, 50.0)
-        base_p_qualif_1 = o1 / (o1 + o2)
+        # Force CONDITIONNELLE (cv_inv / surv) au lieu du simple ratio des cotes de
+        # victoire : une équipe ayant déjà battu de gros adversaires est renforcée.
+        # NB : si les cotes 1N2 du match sont connues (known_probas_90), cette valeur
+        # est de toute façon écrasée par p1+pN/2 dans simulate_knockout_match_math.
+        base_p_qualif_1 = conditional_matchup_prob(
+            id_to_odds.get(t1, 50.0), surv.get(t1, 1.0),
+            id_to_odds.get(t2, 50.0), surv.get(t2, 1.0),
+        )
         
         # --- APPEL DU MOTEUR MATHÉMATIQUE (Factorisé) ---
         p_120_drift, g, c, p_qualif_final = simulate_knockout_match_math(
@@ -349,7 +379,14 @@ def generate_bracket_scenario(df_odds, df_tournoi=None):
             r = np.random.rand()
             winner = t1 if r < p_qualif_final else t2
             loser = t2 if winner == t1 else t1
-            
+
+        # Mise à jour de la survie pour le tour suivant : on multiplie par la prob
+        # A PRIORI de victoire du gagnant à ce match (cotes 1N2 si connues, sinon
+        # ratio conditionnel) — MÊME si le résultat est forcé par la réalité : c'est
+        # ce prior qui encode "a-t-il battu un cador ?" et fait grimper sa force.
+        p_adv_winner = p_qualif_final if winner == t1 else (1.0 - p_qualif_final)
+        surv[winner] = surv.get(winner, 1.0) * p_adv_winner
+
         if m in next_match_map:
             nm, slot = next_match_map[m]
             bracket_teams[nm, slot] = winner
