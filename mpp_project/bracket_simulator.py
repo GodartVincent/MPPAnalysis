@@ -400,9 +400,20 @@ def generate_bracket_scenario(df_odds, df_tournoi=None):
 # ==========================================
 # 3. L'INTÉGRATEUR GÉANT (VERSION FINALE HYBRIDE)
 # ==========================================
-def compute_robust_endgame_horizon(my_fav, my_scorer, path_poules="data/CDM_2026.csv", n_simulations=15):
-    print(f"--- DÉMARRAGE DU CALCUL HORIZON ({n_simulations} arbres) ---")
-    print(f"Portfolio Agent -> Favori: {my_fav.upper()} | Buteur: {my_scorer.upper()}")
+def compute_robust_endgame_horizon(my_fav, my_scorer, path_poules="data/CDM_2026.csv",
+                                   n_simulations=15, save=True, verbose=True):
+    """
+    Calcule l'horizon des phases finales pour un portefeuille (favori, buteur) donné.
+
+    Retourne toujours V_start_1001 (7D : 32, 1001, 1001, 2, 2, 2, 2).
+    save=True   : écrit aussi les .npy sur disque (usage de production).
+    save=False  : ne touche pas au disque (usage validation, ex. recherche du meilleur
+                  combo favori/buteur dans le Notebook 16).
+    verbose     : journalise la progression (couper pour les boucles sur plusieurs combos).
+    """
+    if verbose:
+        print(f"--- DÉMARRAGE DU CALCUL HORIZON ({n_simulations} arbres) ---")
+        print(f"Portfolio Agent -> Favori: {my_fav.upper()} | Buteur: {my_scorer.upper()}")
     
     # 1. Chargement des données
     df_odds, df_fav, df_sco = load_and_prepare_data("data/CDM_2026_group_stage_odds.csv", "data/CDM_2026_goal_scorer_and_favorite.csv")
@@ -437,12 +448,13 @@ def compute_robust_endgame_horizon(my_fav, my_scorer, path_poules="data/CDM_2026
             affiches_16e_connues = True
 
     # 3. Affichage du vrai statut
-    if match_idx_pf > 0:
-        print(f"MODE HORIZON GLISSANT : {match_idx_pf} matchs de phases finales déjà validés.")
-    elif affiches_16e_connues:
-        print(f"MODE HORIZON GLISSANT : Début des 16èmes de finale (Affiches connues, 0 match terminé).")
-    else:
-        print(f"MODE AVANT-TOURNOI : Pré-calcul complet depuis la fin des poules.")
+    if verbose:
+        if match_idx_pf > 0:
+            print(f"MODE HORIZON GLISSANT : {match_idx_pf} matchs de phases finales déjà validés.")
+        elif affiches_16e_connues:
+            print(f"MODE HORIZON GLISSANT : Début des 16èmes de finale (Affiches connues, 0 match terminé).")
+        else:
+            print(f"MODE AVANT-TOURNOI : Pré-calcul complet depuis la fin des poules.")
     
     fav_names = df_fav['selection'].tolist()
     fav_probs = df_fav['estimated_crowd'].values
@@ -540,15 +552,16 @@ def compute_robust_endgame_horizon(my_fav, my_scorer, path_poules="data/CDM_2026
             
         V_sum += V_scenario
         
-        if (i + 1) % 5 == 0 or (i + 1) == n_simulations:
+        if verbose and ((i + 1) % 5 == 0 or (i + 1) == n_simulations):
             elapsed = time.time() - start_time
             print(f"[{i + 1}/{n_simulations}] Arbres traités. Temps : {elapsed:.1f}s")
-            
+
     # Moyenne de l'incertitude
     V_final = V_sum / n_simulations
-    
+
     # 4. EXPORT INTELLIGENT DE L'HORIZON (AVEC UPSAMPLING)
-    print("\nÉlargissement de la grille (Upsampling vers 1001x1001)...")
+    if verbose:
+        print("\nÉlargissement de la grille (Upsampling vers 1001x1001)...")
     
     # Le code s'adapte selon que V_final est en 6D (une seule matrice) ou 7D (32 matrices)
     if V_final.ndim == 6:
@@ -567,21 +580,25 @@ def compute_robust_endgame_horizon(my_fav, my_scorer, path_poules="data/CDM_2026
                 idx2 = min(500, int(round(g2 / 2.0)))
                 V_start_1001[:, g1, g2] = V_final[:, idx1, idx2]
                 
-    np.save("data/expected_V_phases_finales_full.npy", V_start_1001)
-    print(f"EXPORT RÉUSSI : data/expected_V_phases_finales_full.npy (Forme: {V_start_1001.shape})")
+    if save:
+        np.save("data/expected_V_phases_finales_full.npy", V_start_1001)
+        print(f"EXPORT RÉUSSI : data/expected_V_phases_finales_full.npy (Forme: {V_start_1001.shape})")
 
-    # --- HORIZON POULES (pour le Notebook 10 / daily_pipeline) ---
-    # On ne le sauve QU'EN MODE AVANT-TOURNOI : dès que les affiches des 16es sont
-    # renseignées, les matchs des 16es ont été écrasés par la réalité dans le bracket,
-    # ce qui biaiserait cet horizon — et de toute façon les poules sont derrière nous.
-    if affiches_16e_connues:
-        print("16es renseignés -> horizon poules (expected_V_phases_finales.npy) NON sauvé "
-              "(poules terminées, horizon biaisé/inutile).")
-    else:
-        V_poules = poules_horizon_from_full(V_start_1001)
-        np.save("data/expected_V_phases_finales.npy", V_poules)
-        print(f"EXPORT RÉUSSI : data/expected_V_phases_finales.npy (Forme: {V_poules.shape}) "
-              f"[horizon poules, favoris vivants]")
+        # --- HORIZON POULES (pour le Notebook 10 / daily_pipeline) ---
+        # On ne le sauve QU'EN MODE AVANT-TOURNOI : dès que les affiches des 16es sont
+        # renseignées, les matchs des 16es ont été écrasés par la réalité dans le bracket,
+        # ce qui biaiserait cet horizon — et de toute façon les poules sont derrière nous.
+        if affiches_16e_connues:
+            print("16es renseignés -> horizon poules (expected_V_phases_finales.npy) NON sauvé "
+                  "(poules terminées, horizon biaisé/inutile).")
+        else:
+            V_poules = poules_horizon_from_full(V_start_1001)
+            np.save("data/expected_V_phases_finales.npy", V_poules)
+            print(f"EXPORT RÉUSSI : data/expected_V_phases_finales.npy (Forme: {V_poules.shape}) "
+                  f"[horizon poules, favoris vivants]")
+
+    return V_start_1001
+
 
 if __name__ == "__main__":
     # Test avec 15 arbres pour être rapide au quotidien (Modifiable le Jour J)
