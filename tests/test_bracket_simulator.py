@@ -9,7 +9,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from mpp_project.bracket_simulator import simulate_group_stages, generate_bracket_scenario
+from mpp_project.bracket_simulator import (
+    simulate_group_stages,
+    generate_bracket_scenario,
+    poules_horizon_from_full,
+)
 from tests.helpers import DATA_DIR
 
 ODDS_PATH = DATA_DIR / "CDM_2026_group_stage_odds.csv"
@@ -119,3 +123,25 @@ def test_override_insensible_a_la_casse(df_odds):
     for i, (a, b) in enumerate(quart_teams):
         assert match_teams[24 + i, 0] == t2id[a], f"quart {i}: team_A non overridée (casse ?)"
         assert match_teams[24 + i, 1] == t2id[b], f"quart {i}: team_B non overridée (casse ?)"
+
+
+# ---------------------------------------------------------------------------
+# poules_horizon_from_full : dérivation de l'horizon poules depuis _full
+# ---------------------------------------------------------------------------
+def test_poules_horizon_7d():
+    """7D (32, g1, g2, booster, fav×3) -> (32, g1, g2, booster), tranche favoris vivants."""
+    full = np.zeros((32, 6, 6, 2, 2, 2, 2), dtype=np.float32)
+    full[..., 1, 1, 1] = 0.42        # favoris vivants
+    full[..., 0, 0, 0] = 0.99        # favoris morts (ne doit PAS être pris)
+    out = poules_horizon_from_full(full)
+    assert out.shape == (32, 6, 6, 2)
+    assert np.allclose(out, 0.42)
+
+
+def test_poules_horizon_6d_ajoute_axe_match():
+    """6D (matrice unique) -> (1, g1, g2, booster) : axe match ajouté pour daily_pipeline[0]."""
+    full = np.zeros((6, 6, 2, 2, 2, 2), dtype=np.float32)
+    full[..., 1, 1, 1] = 0.7
+    out = poules_horizon_from_full(full)
+    assert out.shape == (1, 6, 6, 2)
+    assert np.allclose(out[0], 0.7)

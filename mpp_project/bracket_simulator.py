@@ -228,6 +228,26 @@ def get_phase_str_from_idx(m):
     if m < 30: return "Demi"
     return "Finale"
 
+
+def poules_horizon_from_full(V_full):
+    """
+    Dérive l'horizon "poules" (lu par le Notebook 10 / daily_pipeline) à partir de
+    la matrice riche des phases finales `expected_V_phases_finales_full.npy`.
+
+    L'horizon poules ne suit pas les favoris : on prend la tranche "favoris tous
+    vivants" (index 1 sur my_fav / bob_fav / pack_fav), valide à l'entrée des 16es
+    où aucune équipe n'est encore éliminée.
+
+    Entrée  : V_full de forme (..., g1, g2, booster, my_fav, bob_fav, pack_fav),
+              soit 7D (32, 1001, 1001, 2, 2, 2, 2) soit 6D (1001, 1001, 2, 2, 2, 2).
+    Sortie  : (N, 1001, 1001, 2) avec un axe "match" en tête (N=32 ou 1), compatible
+              avec le `[0]` de daily_pipeline.
+    """
+    V = V_full[..., 1, 1, 1]          # favoris vivants -> supprime les 3 dims favoris
+    if V.ndim == 3:                   # cas 6D (matrice unique) -> ajoute l'axe match
+        V = V[None, ...]
+    return V
+
 def generate_bracket_scenario(df_odds, df_tournoi=None):
     """
     Simulateur Universel (Avant-tournoi & Horizon Glissant).
@@ -358,7 +378,8 @@ def compute_robust_endgame_horizon(my_fav, my_scorer, path_poules="data/CDM_2026
         return
         
     # --- DÉTECTION DU MODE (Le "GPS" du tournoi) ---
-    mask_pf = df_poules['phase'].str.contains('16e|8e|Quart|Demi|Finale', na=False)
+    # case=False : robuste à la casse (convention CSV en minuscules : quart/demi/finale)
+    mask_pf = df_poules['phase'].str.contains('16e|8e|quart|demi|finale', case=False, na=False)
     df_pf = df_poules[mask_pf].reset_index(drop=True)
     
     # 1. Combien de résultats de PF sont déjà connus ?
@@ -511,6 +532,19 @@ def compute_robust_endgame_horizon(my_fav, my_scorer, path_poules="data/CDM_2026
                 
     np.save("data/expected_V_phases_finales_full.npy", V_start_1001)
     print(f"EXPORT RÉUSSI : data/expected_V_phases_finales_full.npy (Forme: {V_start_1001.shape})")
+
+    # --- HORIZON POULES (pour le Notebook 10 / daily_pipeline) ---
+    # On ne le sauve QU'EN MODE AVANT-TOURNOI : dès que les affiches des 16es sont
+    # renseignées, les matchs des 16es ont été écrasés par la réalité dans le bracket,
+    # ce qui biaiserait cet horizon — et de toute façon les poules sont derrière nous.
+    if affiches_16e_connues:
+        print("16es renseignés -> horizon poules (expected_V_phases_finales.npy) NON sauvé "
+              "(poules terminées, horizon biaisé/inutile).")
+    else:
+        V_poules = poules_horizon_from_full(V_start_1001)
+        np.save("data/expected_V_phases_finales.npy", V_poules)
+        print(f"EXPORT RÉUSSI : data/expected_V_phases_finales.npy (Forme: {V_poules.shape}) "
+              f"[horizon poules, favoris vivants]")
 
 if __name__ == "__main__":
     # Test avec 15 arbres pour être rapide au quotidien (Modifiable le Jour J)

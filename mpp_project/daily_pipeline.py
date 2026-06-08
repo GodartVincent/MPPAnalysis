@@ -68,7 +68,8 @@ def run_daily_pipeline(
         p_empirique_1D = p_empirique_1D_full[:n_matches]
     max_gain_dynamique = p_empirique_1D.shape[2]
 
-    # On charge la matrice 4D générée par compute_expected_V_phases_finales
+    # On charge l'horizon des phases finales généré par bracket_simulator.py
+    # (expected_V_phases_finales.npy = matrice _full marginalisée sur les favoris vivants).
     # On isole la matrice du premier match des phases finales (index 0)
     # V_next_base : (1001, 1001, 2) → downsamplé en (501, 501, 2) pour solve_dp_coarse
     if v_horizon_override is not None:
