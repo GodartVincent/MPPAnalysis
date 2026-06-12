@@ -125,6 +125,23 @@ def build_pipeau_dataframe(n_matchs, true_proba, crowd, gains, phase="poules"):
     return pd.DataFrame(rows)
 
 
+def build_terminal_horizon(grid_size=1001, offset=600):
+    """Horizon (grid_size, grid_size, 2) = condition terminale signe-de-gap JOINTE.
+
+    Reproduit la matrice que solve_dp_coarse/_full construisaient en interne avec
+    start_t<0 : V[g1,g2] = 1 si les deux gaps > 0, 0.5 si un seul == 0 et l'autre > 0,
+    1/3 si (0,0), 0 sinon. À injecter comme `v_horizon_override` pour simuler une
+    partie AUTO-CONTENUE (poules = fin du jeu) face à l'oracle `exact_theoretical_wr`,
+    maintenant que le pipeline chaîne réellement vers l'horizon au lieu de l'écraser.
+    """
+    vals = np.arange(grid_size) - offset
+    g1, g2 = vals[:, None], vals[None, :]
+    win = np.where((g1 > 0) & (g2 > 0), 1.0,
+          np.where(((g1 == 0) & (g2 > 0)) | ((g1 > 0) & (g2 == 0)), 0.5,
+          np.where((g1 == 0) & (g2 == 0), 1.0 / 3.0, 0.0)))
+    return np.repeat(win[:, :, None], 2, axis=2).astype(np.float32)
+
+
 def build_ghost_peloton(n_matchs, max_gain=250):
     """
     Distribution de peloton FANTÔME : toute la masse sur delta_gain = 0.

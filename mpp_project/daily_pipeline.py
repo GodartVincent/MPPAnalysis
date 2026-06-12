@@ -2,8 +2,8 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
-from mpp_project.core import apply_heteroscedastic_noise, apply_temporal_drift, calculate_true_outcome_probas_from_odds, estimate_crowd_3D, normalize_crowds, validate_match_dataframe
-from mpp_project.oracle_dp import compute_alphas_isolement, compute_full_Q_table, solve_dp_coarse, GAP_MIN, GAP_MAX, GAP_OFFSET
+from mpp_project.core import apply_heteroscedastic_noise, apply_temporal_drift, build_exact_score_market, calculate_true_outcome_probas_from_odds, estimate_crowd_3D, expected_simple_points, normalize_crowds, validate_match_dataframe
+from mpp_project.oracle_dp import compute_alphas_isolement, compute_full_Q_table, evaluate_exact_score_day, solve_dp_coarse, GAP_MIN, GAP_MAX, GAP_OFFSET
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_DIR / "data"
@@ -22,7 +22,8 @@ def run_daily_pipeline(
     p_empirique_override=None,
     v_horizon_override=None,
     save_abaques: bool = True,
-    validate_input: bool = True
+    validate_input: bool = True,
+    exact_score_data=None
 ):
     """
     Exécute la chaîne de décision (Drift + DP) et sauvegarde les abaques des prochains matchs.
@@ -31,14 +32,26 @@ def run_daily_pipeline(
       p_empirique_override : ndarray (n_matches, 3, max_gain). Si fourni, remplace
                              le chargement de p_empirique_1D.npy (ex. peloton fantôme).
       v_horizon_override   : ndarray (1001, 1001, 2). Si fourni, remplace le chargement
-                             de expected_V_phases_finales.npy comme condition limite fine.
-                             NB : ignoré dans le chemin sans drift (use_drift=False), où
-                             solve_dp_coarse applique sa propre condition terminale.
+                             de expected_V_phases_finales.npy comme condition limite (horizon
+                             des phases finales), utilisé dans les deux chemins (avec/sans drift).
+                             Injecter ici une condition terminale signe-de-gap reproduit une
+                             partie auto-contenue (poules = fin), cf. tests oracle.
       save_abaques         : si False, n'écrit aucun fichier Abaque_Match_*.npz sur disque
                              (utile pour ne pas polluer data/ pendant les tests).
       validate_input       : si True (défaut), contrôle la cohérence du CSV (phases,
                              gains, équipes, crowds) et émet des warnings. Mettre à
                              False pour les fixtures de test synthétiques.
+      exact_score_data     : dict { "b1-b2": (cote, crowd_pct) } optionnel. Si fourni,
+                             la décision du MATCH DU JOUR porte sur les SCORES EXACTS
+                             (et non 1N2) : l'agent, Bob et le peloton peuvent décrocher
+                             le bonus de score exact (cf. build_exact_score_market /
+                             evaluate_exact_score_day). Change le contrat de retour :
+                               - mode 1N2 (None)  : (reco, best_wr, ev_actions, Q_table_jour)
+                                 ev_actions = ndarray (3,) des EV par issue.
+                               - mode exact       : (reco, best_wr, market_df, Q_table_jour)
+                                 reco = score exact (+ " x2"), market_df = pandas DataFrame
+                                 (score/outcome/proba/cond_crowd/bonus/WR_base/keep/use).
+                             Q_table_jour reste la Q 1N2 du jour (projection / fallback).
     """
     match_idx = match_id_cible - 1
 
@@ -78,18 +91,10 @@ def run_daily_pipeline(
         V_phases_finales_brut = np.load(DATA_DIR / "expected_V_phases_finales.npy")
         V_next_base = V_phases_finales_brut[0]
     V_next_base_coarse = V_next_base[::2, ::2, :].copy()  # indices 0,2,4,...,1000 → 501 pts
-
-    # Condition terminale coarse (501,501,2) : valeur APRÈS le dernier match du
-    # tournoi. Identique à celle construite en interne par solve_dp_coarse, mais
-    # exposée ici car V_near ne stocke pas V[n_matches]. Sert de V_next à la
-    # Q-table du dernier match si l'horizon des abaques l'atteint (sinon
-    # V_near[match_idx + k + 1] déborderait → IndexError en fin de tournoi).
-    _vals_coarse = np.arange(501) - 300
-    _g1v, _g2v = _vals_coarse[:, None], _vals_coarse[None, :]
-    _win_term = np.where((_g1v > 0) & (_g2v > 0), 1.0,
-                np.where(((_g1v == 0) & (_g2v > 0)) | ((_g1v > 0) & (_g2v == 0)), 0.5,
-                np.where((_g1v == 0) & (_g2v == 0), 1.0 / 3.0, 0.0)))
-    V_term_coarse = np.repeat(_win_term[:, :, None], 2, axis=2).astype(np.float32)
+    # NB : la valeur APRÈS le dernier match de poule = l'entrée des phases finales,
+    # donc l'HORIZON lui-même (V_next_base_coarse), et NON une condition terminale
+    # signe-de-gap. Sert de V_next à la Q-table du dernier match si l'horizon des
+    # abaques l'atteint (sinon V_near[match_idx + k + 1] déborderait en fin de tournoi).
 
     # ==========================================
     # 2. DRIFT & DP  (3 phases, grille grossière 501×501)
@@ -132,8 +137,10 @@ def run_daily_pipeline(
                 alphas_isolement=v_alphas,
                 V_horizon=V_next_base_coarse,
                 stop_t=split_t,
-                horizon_nuit=0
-                # start_t=-1 par défaut : run complet depuis n_matches-1
+                horizon_nuit=0,
+                # start_t=n_matches : démarre à n_matches-1 SANS écraser V_horizon par
+                # le terminal interne -> chaîne réellement vers l'horizon des phases finales.
+                start_t=n_matches
             )
             V_far_sum += V_far_s[split_t]
         V_far_avg = V_far_sum / n_runs  # shape (501, 501, 2)
@@ -159,7 +166,7 @@ def run_daily_pipeline(
         # V_near shape : (n_matches, 501, 501, 2) — on extrait les tranches d'horizon.
         # Pour le dernier match du tournoi, V[n_matches] = condition terminale.
         V_nexts_avg_coarse = np.stack([
-            V_near[match_idx + k + 1] if (match_idx + k + 1) < n_matches else V_term_coarse
+            V_near[match_idx + k + 1] if (match_idx + k + 1) < n_matches else V_next_base_coarse
             for k in range(horizon_effectif)
         ])
     else:
@@ -181,11 +188,12 @@ def run_daily_pipeline(
                 alphas_isolement=v_alphas,
                 V_horizon=V_next_base_coarse,
                 stop_t=match_idx,
-                horizon_nuit=0
+                horizon_nuit=0,
+                start_t=n_matches   # chaîne vers l'horizon knockout (cf. run lointain)
             )
             for k in range(horizon_effectif):
                 nxt = match_idx + k + 1
-                V_nexts_sum[k] += V_near_s[nxt] if nxt < n_matches else V_term_coarse
+                V_nexts_sum[k] += V_near_s[nxt] if nxt < n_matches else V_next_base_coarse
         V_nexts_avg_coarse = V_nexts_sum / n_runs
 
     # Upsample coarse (501,501) → fine (1001,1001) pour compute_full_Q_table
@@ -223,7 +231,16 @@ def run_daily_pipeline(
     g1_idx = max(GAP_MIN, min(GAP_MAX, int(round(mon_gap_1)))) + GAP_OFFSET
     g2_idx = max(GAP_MIN, min(GAP_MAX, int(round(mon_gap_2)))) + GAP_OFFSET
     noms_choix = ["1 (Dom)", "N (Nul)", "2 (Ext)"]
-    
+
+    # --- Mode SCORES EXACTS (match du jour) ---
+    if exact_score_data is not None:
+        return _recommend_exact_score(
+            exact_score_data, g1_idx, g2_idx, has_booster,
+            gains_1N2[match_idx], base_crowds[match_idx], p_empirique_1D[match_idx],
+            base_alphas[match_idx], V_nexts_avg_fine[0], noms_choix, Q_table_jour,
+            outcome_probas=base_true_probas[match_idx]
+        )
+
     if has_booster:
         wr_keep = Q_table_jour[g1_idx, g2_idx, :, 1]
         wr_use = Q_table_jour[g1_idx, g2_idx, :, 2]
@@ -240,5 +257,52 @@ def run_daily_pipeline(
         best_action = np.argmax(wr_base)
         reco = f"{noms_choix[best_action]}"
         best_wr = wr_base[best_action]
-        
+
     return reco, best_wr, ev_actions, Q_table_jour
+
+
+def _recommend_exact_score(exact_score_data, g1_idx, g2_idx, has_booster,
+                           gains_match, crowd_match, p_empirique_match, alpha_match,
+                           V_next, noms_choix, Q_table_jour, outcome_probas=None):
+    """
+    Décision du match du jour sur les SCORES EXACTS. Construit le marché (ancré
+    sur le 1N2 du CSV via outcome_probas), évalue le WR de chaque score via
+    evaluate_exact_score_day, et renvoie (reco, best_wr, market_df, Q_table_jour).
+    """
+    market = build_exact_score_market(exact_score_data, outcome_probas=outcome_probas)
+
+    Q_exact = evaluate_exact_score_day(
+        g1_idx, g2_idx,
+        market.outcomes, market.p_score, market.cond_crowd, market.bonus,
+        gains_match.astype(np.float64), crowd_match.astype(np.float64),
+        p_empirique_match.astype(np.float64), float(alpha_match), V_next
+    )  # shape (K, 3) : [base, keep, use]
+
+    # Choix de l'action (score) et du timing du booster — même logique qu'en 1N2.
+    if has_booster:
+        keep_idx = int(np.argmax(Q_exact[:, 1]))
+        use_idx = int(np.argmax(Q_exact[:, 2]))
+        if Q_exact[use_idx, 2] > Q_exact[keep_idx, 1]:
+            best_idx, best_wr = use_idx, float(Q_exact[use_idx, 2])
+            reco = f"{market.scores[best_idx]} + x2"
+        else:
+            best_idx, best_wr = keep_idx, float(Q_exact[keep_idx, 1])
+            reco = f"{market.scores[best_idx]} (Safe)"
+    else:
+        best_idx = int(np.argmax(Q_exact[:, 0]))
+        best_wr = float(Q_exact[best_idx, 0])
+        reco = f"{market.scores[best_idx]}"
+
+    market_df = pd.DataFrame({
+        "Score": market.scores,
+        "Outcome": [noms_choix[o] for o in market.outcomes],
+        "True Proba (%)": market.p_score * 100.0,
+        "Crowd cond. (%)": market.cond_crowd * 100.0,
+        "Bonus": market.bonus,
+        "E[pts 1/2/3]": expected_simple_points(market),
+        "WR base (%)": Q_exact[:, 0] * 100.0,
+        "WR keep (%)": Q_exact[:, 1] * 100.0,
+        "WR x2 (%)": Q_exact[:, 2] * 100.0,
+    })
+
+    return reco, best_wr, market_df, Q_table_jour

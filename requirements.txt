@@ -59,6 +59,7 @@ scikit-learn==1.7.2
 scipy==1.16.3
 seaborn==0.13.2
 setuptools==80.9.0
+shin==0.2.2
 six==1.17.0
 stack-data==0.6.3
 sympy==1.14.0

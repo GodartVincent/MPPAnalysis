@@ -15,7 +15,7 @@ import pytest
 
 from mpp_project.daily_pipeline import run_daily_pipeline
 from mpp_project.oracle_dp import GAP_OFFSET, GAP_MIN, GAP_MAX
-from tests.helpers import exact_theoretical_wr, terminal_strict, DATA_TESTS_DIR
+from tests.helpers import exact_theoretical_wr, terminal_strict, build_terminal_horizon, DATA_TESTS_DIR
 
 TOL = 0.005
 GAP_PELOTON_SAFE = 400  # +400 réel : peloton distancé pour toujours (alpha sans effet)
@@ -38,6 +38,8 @@ def q_table_jour(pipeau_csv, ghost_peloton_4):
         horizon_nuit=1,         # seule la Q-table du jour ; profondeur = n_matchs
         nb_scenarios=1,
         p_empirique_override=ghost_peloton_4,
+        # Partie auto-contenue : l'horizon = terminal signe-de-gap (poules = fin).
+        v_horizon_override=build_terminal_horizon(),
         save_abaques=False,
         validate_input=False,   # fixture synthétique (pas de colonnes équipes, phase libre)
     )
@@ -107,6 +109,7 @@ def test_dernier_match_pas_d_overflow(pipeau_csv, ghost_peloton_4, pipeau_params
         horizon_nuit=5,        # > matchs restants (1) → exerce le cas terminal
         nb_scenarios=1,
         p_empirique_override=ghost_peloton_4,
+        v_horizon_override=build_terminal_horizon(),  # auto-contenu : horizon = terminal
         save_abaques=False,
         validate_input=False,
     )
@@ -146,6 +149,7 @@ def _run_reco(tmp_path, true_proba, crowd, gains, n_matchs=3):
         horizon_nuit=1,
         nb_scenarios=1,
         p_empirique_override=build_ghost_peloton(n_matchs, max_gain=250),
+        v_horizon_override=build_terminal_horizon(),  # auto-contenu : horizon = terminal
         save_abaques=False,
         validate_input=False,
     )

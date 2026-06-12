@@ -6,7 +6,9 @@ import warnings
 
 import pandas as pd
 import numpy as np
+import shin
 import unicodedata
+from collections import namedtuple
 from scipy.stats import binom
 from typing import Tuple
 
@@ -23,10 +25,10 @@ CROWD_BETA = 2.24       # Paramètre de sur-réaction aux favoris
 CROWD_EPSILON = 0.009   # Plancher incompressible (0.9%) pour les trolls/clics fous
 RMSE_CROWD = 0.083      # RMSE du fit : ecart-type du bruit gaussien à ajouter au crowd pour les simuler de manière réaliste.
 
-MIN_MPP_GAIN = 15.0  # Gain MPP minimum réaliste (allemaagne - curacao : 15.0)
-MAX_MPP_GAIN = 225.0  # Gain MPP maximum réaliste (allemaagne - curacao : 222.0)
-MIN_TRUE_PROBA = 0.02  # Probabilité minimale réaliste d'une issue (allemaagne - curacao : 0.02)
-MAX_TRUE_PROBA = 0.95  # Probabilité maximale réaliste d'une issue (allemaagne - curacao : 0.95)
+MIN_MPP_GAIN = 15.0  # Gain MPP minimum réaliste (allemagne - curacao : 15.0)
+MAX_MPP_GAIN = 225.0  # Gain MPP maximum réaliste (allemagne - curacao : 222.0)
+MIN_TRUE_PROBA = 0.02  # Probabilité minimale réaliste d'une issue (allemagne - curacao : 0.02)
+MAX_TRUE_PROBA = 0.95  # Probabilité maximale réaliste d'une issue (allemagne - curacao : 0.95)
 
 def calculate_win_probability(min_successes: int, num_matches: int, success_prob: float) -> float:
     """
@@ -50,28 +52,42 @@ def get_ev_with_bonus(outcome_prob: float, perfect_prob_given_outcome: float, po
 
 def calculate_true_outcome_probas_from_odds(odds: np.ndarray) -> np.ndarray:
     """
-    Calculates normalized ground truth probabilities from bookmaker odds.
-    Expects odds to be a NumPy array of shape (N, 3) or (3,).
+    Calcule les probabilités vraies (sans marge bookmaker) à partir des cotes,
+    via la méthode de Shin (`shin.calculate_implied_probabilities`) qui corrige
+    le biais favori/outsider plutôt qu'une simple normalisation 1/cote.
+
+    Comportement selon la forme de l'entrée (inchangé historiquement) :
+      - tableau (N, 3) : chaque ligne est un match indépendant à 3 issues ->
+        Shin appliqué ligne par ligne, sortie (N, 3) sommant à 1 par ligne.
+      - tableau 1D de taille K : K issues d'UN SEUL événement (ex : marché du
+        vainqueur du tournoi, du meilleur buteur) -> Shin appliqué une fois,
+        sortie (K,) sommant à 1.
+
+    Invariant : si les cotes sont "justes" (somme des 1/cote == 1, aucune marge),
+    Shin restitue exactement les probabilités implicites normalisées.
     """
     # Conversion en float pour éviter les divisions entières ou les types mixtes
     odds_array = np.asarray(odds, dtype=float)
-    
-    # 1. Calcul de l'inverse des cotes
-    inv_odds = 1.0 / odds_array
-    
-    # 2. Somme par ligne (par match)
-    # Si le tableau a une seule dimension (ex: un seul match [2.0, 3.0, 3.0]),
-    # sum() s'applique normalement. Si c'est 2D (N, 3), on utilise axis=1.
-    if inv_odds.ndim == 2:
-        total_inv_odds = np.sum(inv_odds, axis=1, keepdims=True)
-    else:
-        total_inv_odds = np.sum(inv_odds)
 
-    # 2bis. Garde-fou : la somme des probabilités implicites (1/cote) vaut
-    # 1 + marge bookmaker. Une marge NÉGATIVE (somme < 1) est impossible pour un
-    # vrai book (ce serait une opportunité d'arbitrage) -> faute de saisie probable.
-    _sums = np.atleast_1d(total_inv_odds).ravel()
-    for i, s in enumerate(_sums):
+    # Garde-fou : la somme des probabilités implicites (1/cote) vaut 1 + marge
+    # bookmaker. Une marge NÉGATIVE (somme < 1) est impossible pour un vrai book
+    # (ce serait une opportunité d'arbitrage) -> faute de saisie probable. Le
+    # plafond > 1.15 ne vaut que pour le 1N2 (<= 3 issues) : un marché outright
+    # à K issues a un overround naturellement bien plus élevé.
+    if odds_array.ndim == 2:
+        events = odds_array
+    else:
+        events = odds_array.reshape(1, -1)
+    # Le contrôle de marge ne vaut que pour un marché 1N2 COMPLET (<= 3 issues) :
+    # une somme(1/cote) < 1 y est impossible (arbitrage), > 1.15 trahit une saisie
+    # douteuse. Un marché outright partiel (favoris, buteurs) ne liste qu'un sous-
+    # ensemble d'issues -> sa somme peut légitimement tomber sous 1 ou dépasser 1.15.
+    for i, row in enumerate(events):
+        if row.size > 3:
+            continue
+        with np.errstate(divide="ignore"):
+            inv = 1.0 / row
+        s = float(np.sum(inv[np.isfinite(inv)]))
         if s <= 0.0:
             continue
         if s < 1.0 - 1e-9:
@@ -87,20 +103,17 @@ def calculate_true_outcome_probas_from_odds(odds: np.ndarray) -> np.ndarray:
                 stacklevel=2,
             )
 
-    # 3. Sécurité contre la division par zéro
-    # np.where est très puissant pour faire des conditions sans boucle for
-    safe_total = np.where(total_inv_odds == 0, 1.0, total_inv_odds)
-    
-    # 4. Normalisation
-    true_probas = inv_odds / safe_total
-    
-    # On remet à zéro les lignes où le total était nul
-    if inv_odds.ndim == 2:
-        true_probas = np.where(total_inv_odds == 0, 0.0, true_probas)
-    else:
-        true_probas = np.where(total_inv_odds == 0, 0.0, true_probas)
-        
-    return true_probas
+    # Application de Shin par événement. Une ligne de cotes invalides
+    # (non finies ou <= 0) renvoie des probabilités nulles (cf. division par
+    # zéro historique).
+    def _shin_row(row: np.ndarray) -> np.ndarray:
+        if row.size == 0 or not np.all(np.isfinite(row)) or np.any(row <= 0.0):
+            return np.zeros_like(row)
+        return np.asarray(shin.calculate_implied_probabilities(row.tolist()), dtype=float)
+
+    if odds_array.ndim == 2:
+        return np.vstack([_shin_row(row) for row in odds_array])
+    return _shin_row(odds_array)
 
 def get_observation(
     match_probas: np.ndarray,      # (3,) Raw probabilities
@@ -508,6 +521,29 @@ def validate_team_consistency(df_matches, df_group_odds=None, df_market=None, mi
         _check(favs, "favorite")
 
 
+def result_to_outcome(result, team_a, team_b):
+    """
+    Convertit une valeur de la colonne 'result' d'un match en indice d'issue 1N2 :
+      - nom de l'équipe à domicile (team_a)  -> 0  ('1')
+      - 'nul' (ou n / x / draw)              -> 1  ('N')
+      - nom de l'équipe à l'extérieur (team_b) -> 2  ('2')
+      - vide / NaN / non reconnu             -> -1 (match futur ou à ignorer)
+
+    Convention alignée sur le knockout (on renseigne le nom du vainqueur, ou 'nul').
+    Comparaison insensible à la casse et aux espaces.
+    """
+    res = str(result).strip().lower()
+    if res in ("", "nan", "none"):
+        return -1
+    if res in ("nul", "n", "x", "draw", "match nul"):
+        return 1
+    if res == str(team_a).strip().lower():
+        return 0
+    if res == str(team_b).strip().lower():
+        return 2
+    return -1
+
+
 def apply_heteroscedastic_noise(crowds, rmse=0.083):
     """
     Applique un bruit hétéroscédastique (variance max à 0.5) sur une matrice de probabilités.
@@ -587,5 +623,217 @@ def generate_drifted_ensemble_crowds(match_du_jour_idx, probas_poules, csv_crowd
     ensemble_crowds = np.zeros((n_ensembles, n_poules, 3), dtype=np.float32)
     for e in range(n_ensembles):
         ensemble_crowds[e] = apply_heteroscedastic_noise(blended_mean_crowds, rmse=dynamic_rmse)
-        
+
     return ensemble_crowds
+
+
+# ==========================================================================
+# SCORES EXACTS (match du jour) — barème de bonus + construction du marché
+# ==========================================================================
+# En plus du gain d'outcome (gain_mpp[1N2]), MPP attribue un BONUS si le score
+# exact est trouvé. Le bonus est d'autant plus gros que le score est RARE parmi
+# les joueurs qui ont déjà trouvé le bon outcome (crowd conditionnel `cc`).
+
+def exact_score_bonus(cond_crowd: float) -> int:
+    """
+    Bonus de points du score exact en fonction du crowd CONDITIONNEL `cc`
+    (= part des joueurs ayant trouvé le bon outcome qui ont aussi le bon score).
+
+      cc > 30%        -> 20
+      20% < cc <= 30% -> 30
+      5%  < cc <= 20% -> 50
+      0.5%< cc <= 5%  -> 70
+      cc <= 0.5%      -> 100
+    """
+    if cond_crowd > 0.30:
+        return 20
+    if cond_crowd > 0.20:
+        return 30
+    if cond_crowd > 0.05:
+        return 50
+    if cond_crowd > 0.005:
+        return 70
+    return 100
+
+
+def _score_to_outcome(score) -> int:
+    """Parse un score "b1-b2" en indice d'issue 1N2 : b1>b2 -> 0, b1==b2 -> 1, b1<b2 -> 2."""
+    b1, b2 = (int(x) for x in str(score).split("-"))
+    if b1 > b2:
+        return 0
+    if b1 == b2:
+        return 1
+    return 2
+
+
+# Structure alignée décrivant le marché des scores exacts d'un match.
+#   scores      : list[str]            noms des scores listés (cote valide)
+#   outcomes    : ndarray int8 (K,)    issue 1N2 de chaque score (0/1/2)
+#   p_score     : ndarray float64 (K,) proba vraie (Shin), somme = 1
+#   cond_crowd  : ndarray float64 (K,) crowd normalisé PAR OUTCOME (somme = 1 par issue)
+#   bonus       : ndarray int64 (K,)   bonus de points (barème exact_score_bonus)
+ExactScoreMarket = namedtuple(
+    "ExactScoreMarket", ["scores", "outcomes", "p_score", "cond_crowd", "bonus"]
+)
+
+
+def build_exact_score_market(exact_score_data, outcome_probas=None,
+                             outcome_tol=0.08) -> ExactScoreMarket:
+    """
+    Construit le marché des scores exacts à partir d'un dict
+    `{ "b1-b2": (cote, crowd_pct), ... }`. Les slots à cote absente
+    (None / <= 0) sont ignorés ; `crowd_pct` None est traité comme 0.
+
+    - probas vraies via `calculate_true_outcome_probas_from_odds` (forme 1D ->
+      méthode de Shin sur K issues d'UN événement) ;
+    - crowd conditionnel : crowd(s) normalisé par la somme des crowds des scores
+      du MÊME outcome (cf. barème de bonus) ;
+    - bonus : `exact_score_bonus(cond_crowd)`.
+
+    Lève ValueError si aucun score n'a de cote valide.
+
+    ANCRAGE 1N2 (`outcome_probas`, array (3,) optionnel) :
+      Les cotes de scores exacts (souvent issues d'un autre book, ex. Winamax) sont
+      MOINS fiables que le 1N2 du CSV principal. Si `outcome_probas` est fourni
+      (typiquement `base_true_probas[match_idx]`), on ANCRE : à l'intérieur de
+      chaque outcome o, les probas des scores listés sont remises à l'échelle pour
+      sommer EXACTEMENT à `outcome_probas[o]`. Les cotes de scores ne fixent alors
+      que la répartition RELATIVE intra-outcome, jamais le total de l'outcome.
+      Conséquence : `Σ_{out(s)=o} p_score(s) == P(o)` par construction (le total
+      ne peut être ni inférieur ni supérieur à P(o)).
+
+      Si `outcome_probas` est None (rétro-compat / tests), on RENORMALISE simplement
+      le vecteur global à 1 (outright partiel : masse des scores non listés repliée
+      sur les listés).
+    """
+    scores, odds, crowds, outcomes = [], [], [], []
+    for score, data in exact_score_data.items():
+        cote, crowd = data
+        if cote is None or cote <= 0:
+            continue
+        scores.append(str(score))
+        odds.append(float(cote))
+        crowds.append(float(crowd) if crowd else 0.0)
+        outcomes.append(_score_to_outcome(score))
+
+    if not scores:
+        raise ValueError("build_exact_score_market : aucun score avec une cote valide.")
+
+    odds = np.asarray(odds, dtype=float)
+    outcomes = np.asarray(outcomes, dtype=np.int8)
+    crowds = np.asarray(crowds, dtype=float)
+
+    # Probas vraies relatives (Shin sur les K cotes)
+    p_score = np.asarray(calculate_true_outcome_probas_from_odds(odds), dtype=float)
+
+    if outcome_probas is not None:
+        # ANCRAGE : chaque bloc d'outcome est remis à l'échelle à P(o) du CSV 1N2.
+        op = np.asarray(outcome_probas, dtype=float)
+
+        # VALIDATION anti-faute de saisie : comparer le 1N2 BRUT agrégé des scores
+        # exacts (Shin normalisé à 1) au 1N2 du CSV. Un gros écart trahit soit une
+        # coquille de cote, soit une liste de scores trop incomplète pour un outcome.
+        raw_total = float(p_score.sum())
+        if raw_total > 0.0:
+            raw_norm = p_score / raw_total
+            for o in (0, 1, 2):
+                agg_o = float(raw_norm[outcomes == o].sum())
+                if abs(agg_o - op[o]) > outcome_tol:
+                    warnings.warn(
+                        f"Scores exacts : 1N2 agrégé de l'outcome {o} = {agg_o:.1%} "
+                        f"vs {op[o]:.1%} (CDM_2026) — écart > {outcome_tol:.0%}. "
+                        f"Vérifier la saisie des cotes (ou liste de scores incomplète).",
+                        stacklevel=2,
+                    )
+
+        p_anchored = np.zeros_like(p_score)
+        for o in (0, 1, 2):
+            mask = outcomes == o
+            s = float(p_score[mask].sum())
+            if s > 0.0:
+                p_anchored[mask] = p_score[mask] / s * op[o]
+            # si aucun score listé pour o, la masse P(o) est perdue (renorm. ci-dessous)
+        p_score = p_anchored
+
+    # Renormalisation finale à 1 (no-op si ancrage et 3 outcomes représentés ;
+    # rattrape la masse perdue d'un outcome sans score listé, ou un overround creux).
+    total = float(p_score.sum())
+    if total > 0.0:
+        p_score = p_score / total
+
+    # Crowd conditionnel : normalisation PAR OUTCOME
+    cond_crowd = np.zeros_like(crowds)
+    for o in (0, 1, 2):
+        mask = outcomes == o
+        tot = float(crowds[mask].sum())
+        if tot > 0.0:
+            cond_crowd[mask] = crowds[mask] / tot
+
+    bonus = np.asarray([exact_score_bonus(cc) for cc in cond_crowd], dtype=np.int64)
+
+    return ExactScoreMarket(scores, outcomes, p_score, cond_crowd, bonus)
+
+
+def expected_simple_points(market: ExactScoreMarket) -> np.ndarray:
+    """
+    Espérance de points de chaque score listé sous un barème SIMPLE (indépendant
+    du modèle MPP/bonus), utile pour repérer les paris robustes :
+      3 pts  si score exact ;
+      2 pts  si bon outcome ET bonne différence de buts (mais pas le score exact) ;
+      1 pt   si bon outcome mais mauvaise différence de buts ;
+      0 pt   sinon.
+
+    L'espérance est prise sur la distribution `market.p_score` des scores RÉELS
+    listés (les scores non listés sont ignorés — approximation d'affichage).
+
+    Retourne un array (K,) aligné sur `market.scores`.
+    """
+    goals = [tuple(int(x) for x in s.split("-")) for s in market.scores]
+    diffs = np.array([g[0] - g[1] for g in goals], dtype=np.int64)
+    outcomes = np.asarray(market.outcomes)
+    p = np.asarray(market.p_score, dtype=float)
+    K = len(market.scores)
+
+    E = np.zeros(K, dtype=float)
+    for kb in range(K):                      # pari = score kb
+        ob, db = outcomes[kb], diffs[kb]
+        same_out = outcomes == ob
+        same_diff = same_out & (diffs == db)
+        # points par score réel ks : 1 (bon outcome) + 1 (bonne diff) + 1 (exact)
+        pts = same_out.astype(float) + same_diff.astype(float)
+        pts[kb] += 1.0                       # le score exact ajoute le 3e point
+        E[kb] = float(np.dot(p, pts))
+    return E
+
+
+def load_exact_scores(csv_path, match_id) -> dict:
+    """
+    Charge les scores exacts d'un match depuis un CSV (colonnes `match_id, score,
+    cote, crowd`) et renvoie le dict `{ "b1-b2": (cote, crowd) }` attendu par
+    `build_exact_score_market` / `run_daily_pipeline(exact_score_data=...)`.
+
+    Avantage vs un dict codé dans le notebook : données scopées par `match_id`
+    (pas de mise à zéro défensive, pas de risque de syntaxe Python, éditable au
+    tableur, historique conservé).
+
+    Cote vide (NaN) -> None (score ignoré en aval) ; crowd vide -> None (= 0).
+    Lève ValueError si colonnes manquantes ou aucun score pour ce `match_id`.
+    """
+    df = pd.read_csv(csv_path)
+    required = {"match_id", "score", "cote", "crowd"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"load_exact_scores : colonnes manquantes {sorted(missing)} dans {csv_path}."
+        )
+    sub = df[df["match_id"] == match_id]
+    if sub.empty:
+        raise ValueError(
+            f"load_exact_scores : aucun score pour match_id={match_id} dans {csv_path}."
+        )
+    data = {}
+    for _, r in sub.iterrows():
+        cote = None if pd.isna(r["cote"]) else float(r["cote"])
+        crowd = None if pd.isna(r["crowd"]) else float(r["crowd"])
+        data[str(r["score"]).strip()] = (cote, crowd)
+    return data

@@ -114,3 +114,31 @@ def test_proprietes_generales():
     # delta_pack >= 0 (le peloton ne peut pas reculer) : bin 0 inclus, jamais négatif
     # (garanti par construction ; on vérifie qu'aucune masse n'est "perdue").
     assert p.shape == (n_matches, 3, MAX_GAIN)
+
+
+# ===========================================================================
+# 4. ISSUES RÉELLES CONNUES (known_outcomes — mode horizon glissant)
+# ===========================================================================
+def test_known_outcomes_fixe_les_issues_passees():
+    """
+    Pour un match passé (known_outcomes >= 0), seule l'issue réelle est peuplée ;
+    un match futur (-1) garde ses 3 issues possibles. Le défaut (None) est inchangé.
+    """
+    tp = _tile([0.5, 0.3, 0.2], 3)
+    cr = _tile([0.5, 0.3, 0.2], 3)
+    g = np.tile([10, 20, 30], (3, 1)).astype(np.int32)
+    ko = np.array([0, 2, -1])   # match 0 -> '1', match 1 -> '2', match 2 -> futur
+
+    p = extract_peloton_full_distribution(
+        tp, cr, g, max_gain=MAX_GAIN, n_runs=100_000, n_players=N_PLAYERS,
+        known_outcomes=ko,
+    )
+
+    # Match 0 joué (issue 0) : seule out=0 peuplée
+    assert p[0, 0].sum() == pytest.approx(1.0, abs=1e-9)
+    assert p[0, 1].sum() == 0.0 and p[0, 2].sum() == 0.0
+    # Match 1 joué (issue 2) : seule out=2 peuplée
+    assert p[1, 2].sum() == pytest.approx(1.0, abs=1e-9)
+    assert p[1, 0].sum() == 0.0 and p[1, 1].sum() == 0.0
+    # Match 2 futur : les 3 issues restent possibles
+    assert all(p[2, o].sum() == pytest.approx(1.0, abs=1e-9) for o in range(3))

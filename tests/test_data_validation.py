@@ -15,6 +15,7 @@ from mpp_project.core import (
     calculate_true_outcome_probas_from_odds,
     validate_match_dataframe,
     validate_team_consistency,
+    result_to_outcome,
 )
 from tests.helpers import DATA_DIR
 
@@ -127,6 +128,19 @@ def test_validate_df_colonnes_absentes_ok():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         validate_match_dataframe(df)
+
+
+# ---------------------------------------------------------------------------
+# result_to_outcome (colonne 'result' -> indice d'issue 1N2)
+# ---------------------------------------------------------------------------
+def test_result_to_outcome():
+    assert result_to_outcome("France", "france", "bresil") == 0     # vainqueur = domicile
+    assert result_to_outcome("BRESIL", "france", "bresil") == 2     # vainqueur = extérieur
+    assert result_to_outcome("nul", "france", "bresil") == 1        # match nul
+    assert result_to_outcome("N", "france", "bresil") == 1
+    assert result_to_outcome("", "france", "bresil") == -1          # vide -> futur
+    assert result_to_outcome(float("nan"), "france", "bresil") == -1
+    assert result_to_outcome("espagne", "france", "bresil") == -1   # non reconnu -> ignoré
 
 
 # ---------------------------------------------------------------------------

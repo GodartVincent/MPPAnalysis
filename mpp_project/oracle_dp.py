@@ -10,7 +10,14 @@ GAP_OFFSET = -GAP_MIN  # 600
 GRID_SIZE = GAP_MAX - GAP_MIN + 1  # 1001
 
 N_ACTIONS = 3
-N_PLAYERS = 12
+
+# --- Effectifs de la ligue (source UNIQUE : tout le code importe ces constantes
+#     depuis oracle_dp plutôt que d'écrire des nombres en dur). ---
+N_PLAYERS = 9                   # Taille de la ligue MPP.
+COEFF_ROBUSTESSE = 1.25         # Gonflement du peloton simulé pour absorber la variance
+                                # des bonus (favori/buteur ~ x2). cf. NB15/16.
+N_PELOTON = N_PLAYERS - 1                                 # 8 : peloton réel (on retire le leader/Bob).
+N_PELOTON_ROBUSTE = round(N_PELOTON * COEFF_ROBUSTESSE)   # 10 : peloton gonflé pour le Monte-Carlo.
 
 @njit
 def compute_alphas_isolement(true_probas, crowds, gains_1N2, seuil_isolement=80.0):
@@ -127,20 +134,45 @@ def rescale_histogram_1D(ref_hist, ref_gain, target_gain, target_crowd, max_bins
         
     return scaled_hist
 
+def extract_peloton_full_distribution(true_probas_3d, crowds_3d, gains_1N2, max_gain=250,
+                                      n_runs=1000000, n_players=N_PELOTON, known_outcomes=None):
+    """
+    Histogrammes de transition de gap_2 (vitesse du peloton) par match et par issue,
+    estimés par Monte-Carlo (n_runs tournois). Wrapper autour du cœur Numba.
+
+    known_outcomes : array (n_matches,) optionnel.
+      Pour les matchs DÉJÀ JOUÉS (mode horizon glissant en milieu de poules), fournir
+      l'issue RÉELLE (0 = '1', 1 = 'N', 2 = '2') ; -1 = match futur -> issue tirée
+      aléatoirement (comportement par défaut). Fixer les issues passées rend la
+      trajectoire de score du peloton réaliste jusqu'au présent, donc les histogrammes
+      des matchs FUTURS plus représentatifs. Les paris des joueurs restent tirés selon
+      `crowds` (on ne connaît pas les paris réels de la ligue).
+    """
+    n_matches = true_probas_3d.shape[1]
+    if known_outcomes is None:
+        known_outcomes = np.full(n_matches, -1, dtype=np.int64)
+    else:
+        known_outcomes = np.ascontiguousarray(known_outcomes, dtype=np.int64)
+    return _extract_peloton_full_distribution_core(
+        true_probas_3d, crowds_3d, gains_1N2, known_outcomes, max_gain, n_runs, n_players
+    )
+
+
 @njit
-def extract_peloton_full_distribution(true_probas_3d, crowds_3d, gains_1N2, max_gain=250, n_runs=1000000, n_players=11):
+def _extract_peloton_full_distribution_core(true_probas_3d, crowds_3d, gains_1N2,
+                                            known_outcomes, max_gain, n_runs, n_players):
     n_universes = true_probas_3d.shape[0]
     n_matches = true_probas_3d.shape[1]
-    
+
     counts = np.zeros((n_matches, 3, max_gain), dtype=np.float64)
     occurrences = np.zeros((n_matches, 3), dtype=np.float64)
-    
+
     for run in range(n_runs):
         scores = np.zeros(n_players, dtype=np.int32)
         u = run % n_universes
-        
+
         for t in range(n_matches):
-            
+
             # 1. Identification de l'actuel 1er (Futur Bob)
             best_score = -1
             bob_idx = 0
@@ -148,7 +180,7 @@ def extract_peloton_full_distribution(true_probas_3d, crowds_3d, gains_1N2, max_
                 if scores[i] > best_score:
                     best_score = scores[i]
                     bob_idx = i
-                    
+
             # 2. Récupération des points du meilleur PARMI LES AUTRES (prev_second_best)
             prev_second_best = -1
             for i in range(n_players):
@@ -157,13 +189,17 @@ def extract_peloton_full_distribution(true_probas_3d, crowds_3d, gains_1N2, max_
                 if scores[i] > prev_second_best:
                     prev_second_best = scores[i]
             if prev_second_best == -1: prev_second_best = 0
-                    
-            # 3. Tirage de la réalité du match
-            r_true = np.random.rand()
-            if r_true < true_probas_3d[u, t, 0]: true_out = 0
-            elif r_true < true_probas_3d[u, t, 0] + true_probas_3d[u, t, 1]: true_out = 1
-            else: true_out = 2
-            
+
+            # 3. Issue du match : RÉELLE si connue (match passé), sinon tirée au sort
+            ko = known_outcomes[t]
+            if ko >= 0:
+                true_out = ko
+            else:
+                r_true = np.random.rand()
+                if r_true < true_probas_3d[u, t, 0]: true_out = 0
+                elif r_true < true_probas_3d[u, t, 0] + true_probas_3d[u, t, 1]: true_out = 1
+                else: true_out = 2
+
             true_gain_mpp = gains_1N2[t, true_out]
             
             # 4. Pronostics et mise à jour des points de TOUS les adversaires
@@ -568,7 +604,147 @@ def compute_full_Q_table(t, t_prob, c_rep, t_gains, p_empirique_1D, alpha, V_nex
                 Q_table[g2, g1, a, 0] = Q_table[g1, g2, a, 0]
                 Q_table[g2, g1, a, 1] = Q_table[g1, g2, a, 1]
                 Q_table[g2, g1, a, 2] = Q_table[g1, g2, a, 2]
-                
+
     return Q_table
+
+
+# ==========================================================================
+# 3. SCORES EXACTS (match du jour) — évaluateur DP mono-état
+# ==========================================================================
+@njit
+def _lookup_V(val_g1, val_g2, agent_pts, bob_g, pel_delta, alpha, V_next, layer):
+    """
+    Gating temporel identique à compute_full_Q_table : à partir des gaps "réels"
+    (val_g1 vs Bob, val_g2 vs peloton), applique les gains de l'agent (agent_pts),
+    de Bob (bob_g) et le delta peloton (pel_delta), puis lit V_next[.,.,layer].
+    """
+    new_gap_bob = val_g1 + agent_pts - bob_g
+    new_gap_pel = val_g2 + agent_pts - pel_delta
+
+    val_g1_final = min(new_gap_bob, new_gap_pel)
+    val_g2_final = alpha * max(new_gap_bob, new_gap_pel) + (1.0 - alpha) * new_gap_pel
+
+    i1 = max(GAP_MIN, min(GAP_MAX, int(round(val_g1_final)))) + GAP_OFFSET
+    i2 = max(GAP_MIN, min(GAP_MAX, int(round(val_g2_final)))) + GAP_OFFSET
+    return V_next[i1, i2, layer]
+
+
+@njit
+def evaluate_exact_score_day(g1_idx, g2_idx, sc_outcome, sc_p, sc_cc, sc_bonus,
+                             gains_1N2, crowd_1N2, p_empirique_day, alpha, V_next):
+    """
+    Évalue, à l'état courant (g1_idx, g2_idx), le win rate de CHAQUE action de
+    score exact pour le match du jour, en chaînant vers V_next (post-jour, fine
+    1001x1001x2). Renvoie Q de shape (K, 3) : colonnes [base, keep, use].
+
+    Paramètres alignés (K = nb de scores listés) :
+      sc_outcome (K,) issue 1N2 du score, sc_p (K,) proba vraie, sc_cc (K,) crowd
+      conditionnel, sc_bonus (K,) bonus de points. gains_1N2/crowd_1N2 (3,) du match.
+      p_empirique_day (3, max_gain) histogramme de transition gap_2 par issue.
+
+    Modèle du bonus :
+      - agent : touche bonus(score parié) avec certitude si son score == score réel ;
+      - Bob : s'il a le bon outcome, touche bonus(score réel) avec proba cc (sinon non) ;
+      - peloton : pour chaque bin de gain non nul, ajoute bonus(score réel) avec proba cc ;
+      - booster x2 : double (gain_outcome + bonus) de l'AGENT uniquement.
+    """
+    K = sc_outcome.shape[0]
+    max_gain = p_empirique_day.shape[1]
+    Q = np.zeros((K, 3), dtype=np.float32)
+
+    val_g1 = g1_idx - GAP_OFFSET
+    val_g2 = g2_idx - GAP_OFFSET
+
+    for ka in range(K):                       # action agent = parier le score ka
+        a_o = sc_outcome[ka]
+        a_bonus = sc_bonus[ka]
+        v_base = 0.0
+        v_keep = 0.0
+        v_use = 0.0
+
+        for ks in range(K):                   # score RÉEL = ks
+            p_s = sc_p[ks]
+            if p_s == 0.0:
+                continue
+            o = sc_outcome[ks]
+            cc = sc_cc[ks]
+            b_s = sc_bonus[ks]
+            true_gain = gains_1N2[o]
+            out_hist = p_empirique_day[o]
+
+            # Points de l'agent : gain d'outcome si bon outcome, + bonus si score exact
+            agent_outcome_gain = true_gain if a_o == o else 0.0
+            agent_bonus = a_bonus if ka == ks else 0.0   # ka==ks => a_o==o
+            agent_pts_norm = agent_outcome_gain + agent_bonus
+            agent_pts_boost = 2.0 * agent_pts_norm
+
+            for bob_a in range(3):
+                p_bob = crowd_1N2[bob_a]
+                if p_bob == 0.0:
+                    continue
+                bob_correct = (bob_a == o)
+
+                # Branches du bonus de Bob : s'il a le bon outcome, 2 sous-cas
+                # (proba cc : +bonus ; proba 1-cc : rien) ; sinon une seule branche.
+                for bob_branch in range(2):
+                    if bob_correct:
+                        if bob_branch == 0:
+                            p_bob_b = p_bob * cc
+                            bob_g = true_gain + b_s
+                        else:
+                            p_bob_b = p_bob * (1.0 - cc)
+                            bob_g = true_gain
+                    else:
+                        if bob_branch == 1:
+                            continue              # une seule branche si mauvais outcome
+                        p_bob_b = p_bob
+                        bob_g = 0.0
+                    if p_bob_b == 0.0:
+                        continue
+
+                    esp_base = 0.0
+                    esp_keep = 0.0
+                    esp_use = 0.0
+                    for dg in range(max_gain):
+                        p_pel = out_hist[dg]
+                        if p_pel == 0.0:
+                            continue
+
+                        if dg != 0:
+                            # 2 branches du bonus peloton
+                            for pel_branch in range(2):
+                                if pel_branch == 0:
+                                    p_pb = p_pel * cc
+                                    pel_delta = dg + b_s
+                                else:
+                                    p_pb = p_pel * (1.0 - cc)
+                                    pel_delta = float(dg)
+                                if p_pb == 0.0:
+                                    continue
+                                esp_base += p_pb * _lookup_V(val_g1, val_g2, agent_pts_norm,
+                                                            bob_g, pel_delta, alpha, V_next, 0)
+                                esp_keep += p_pb * _lookup_V(val_g1, val_g2, agent_pts_norm,
+                                                            bob_g, pel_delta, alpha, V_next, 1)
+                                esp_use += p_pb * _lookup_V(val_g1, val_g2, agent_pts_boost,
+                                                            bob_g, pel_delta, alpha, V_next, 0)
+                        else:
+                            pel_delta = 0.0
+                            esp_base += p_pel * _lookup_V(val_g1, val_g2, agent_pts_norm,
+                                                         bob_g, pel_delta, alpha, V_next, 0)
+                            esp_keep += p_pel * _lookup_V(val_g1, val_g2, agent_pts_norm,
+                                                         bob_g, pel_delta, alpha, V_next, 1)
+                            esp_use += p_pel * _lookup_V(val_g1, val_g2, agent_pts_boost,
+                                                        bob_g, pel_delta, alpha, V_next, 0)
+
+                    jp = p_s * p_bob_b
+                    v_base += jp * esp_base
+                    v_keep += jp * esp_keep
+                    v_use += jp * esp_use
+
+        Q[ka, 0] = v_base
+        Q[ka, 1] = v_keep
+        Q[ka, 2] = v_use
+
+    return Q
 
 

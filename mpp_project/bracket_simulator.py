@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import time
+import warnings
 from numba import njit
 from pathlib import Path
 import sys
@@ -9,7 +10,7 @@ import sys
 from mpp_project.core import MAX_TRUE_PROBA, MIN_TRUE_PROBA, apply_temporal_drift, estimate_crowd_3D, calculate_mpp_gains, calculate_true_outcome_probas_from_odds
 # On importe le solveur qu'on a codé précédemment
 from mpp_project.end_game_solver import solve_endgame_dp, build_terminal_state
-from mpp_project.oracle_dp import estimate_mpp_crowd, rescale_histogram_1D, extract_peloton_full_distribution
+from mpp_project.oracle_dp import estimate_mpp_crowd, rescale_histogram_1D, extract_peloton_full_distribution, N_PELOTON, N_PELOTON_ROBUSTE
 
 # ==========================================
 # 1. PARSING ET PRÉPARATION DES DONNÉES
@@ -25,16 +26,14 @@ def load_and_prepare_data(odds_path, market_path):
     df_market = pd.read_csv(market_path)
     
     df_fav = df_market[df_market['category'] == 'favorite'].copy()
-    raw_implied_fav = 1.0 / df_fav['cote'].values
-    df_fav['true_proba'] = raw_implied_fav / raw_implied_fav.sum()
+    df_fav['true_proba'] = calculate_true_outcome_probas_from_odds(df_fav['cote'].values)
     
     df_sco = df_market[df_market['category'] == 'scorer'].copy()
     autre_mask = df_sco['selection'].str.lower() == 'autre'
     df_sco_autre = df_sco[autre_mask].copy()
     df_sco_individuals = df_sco[~autre_mask].copy()
     
-    raw_implied_sco = 1.0 / df_sco_individuals['cote'].values
-    df_sco_individuals['true_proba'] = raw_implied_sco / raw_implied_sco.sum()
+    df_sco_individuals['true_proba'] = calculate_true_outcome_probas_from_odds(df_sco_individuals['cote'].values)
     
     mpp_scorers = df_sco_individuals[df_sco_individuals['gain_mpp'].notna()].copy()
     ghost_scorers = df_sco_individuals[df_sco_individuals['gain_mpp'].isna()].copy()
@@ -114,7 +113,7 @@ def precompute_diluted_peloton(df_poules, df_odds_finales, n_brackets=10, n_runs
         gains_1N2=full_gains,
         max_gain=250,
         n_runs=n_runs,
-        n_players=14
+        n_players=N_PELOTON_ROBUSTE
     )
     
     # 5. On retourne les histogrammes des 32 derniers matchs, 
@@ -137,9 +136,12 @@ def simulate_group_stages(df_odds):
     for name, group in groups:
         teams = group.to_dict('records')
         
-        # Poids pour le tirage (basé sur la cote de finir 1er)
-        p1_weights = np.array([1.0 / t['cote_1er'] for t in teams])
-        p1_weights /= p1_weights.sum()
+        # Poids pour le tirage (basé sur la cote de finir 1er) : distribution
+        # P(1er du groupe) sur 4 équipes, dé-viggée par Shin puis renormalisée
+        # (np.random.choice exige une somme exacte de 1).
+        p1_weights = calculate_true_outcome_probas_from_odds(
+            np.array([t['cote_1er'] for t in teams]))
+        p1_weights = p1_weights / p1_weights.sum()
         
         # Tirage séquentiel SANS REMISE (Proxy de Plackett-Luce)
         indices = np.random.choice(4, size=3, replace=False, p=p1_weights)
@@ -248,28 +250,40 @@ def poules_horizon_from_full(V_full):
         V = V[None, ...]
     return V
 
-def conditional_matchup_prob(cv_inv_a, surv_a, cv_inv_b, surv_b, eps=1e-6):
+def conditional_matchup_prob(cv_inv_a, surv_a, cv_inv_b, surv_b, beta=0.95, eps=1e-6):
     """
     Probabilité que l'équipe A batte B dans un match knockout, à partir de leurs
     FORCES CONDITIONNELLES plutôt que du simple ratio des cotes de victoire finale.
 
-    Force conditionnelle = P(victoire finale | tour atteint) = cv_inv / surv, où
+    Force conditionnelle = cv_inv / surv**beta, où
       cv_inv = 1 / cote_victoire (prob a priori de gagner le tournoi, avant poules)
       surv   = P(atteindre ce tour) = (1/cote_qualif) puis × probas des matchs franchis.
 
     Conditionner par la survie fait monter la force d'une équipe qui a déjà éliminé
     de gros morceaux (faible surv -> ratio cv/surv élevé), sous hypothèse
     d'indépendance des matchs.
+
+    beta : exposant d'AMORTISSEMENT du conditionnement (par défaut 0.95, calibré via
+           le notebook 23 pour que les fréquences de titre simulées collent à 1/cote_victoire).
+      - beta = 1.0 : conditionnement COMPLET = cv_inv / surv (identité bayésienne
+                     exacte sous indépendance).
+      - beta = 0.0 : AUCUN conditionnement (surv**0 = 1) -> simple ratio des cotes
+                     de victoire, comme avant l'introduction de la survie.
+      - beta ∈ (0,1) : conditionnement PARTIEL -> limite continûment le boost de
+                     l'outsider (utile car l'hypothèse d'indépendance est imparfaite
+                     et les cotes proviennent de sources hétérogènes). Plus beta est
+                     petit, moins « battre un cador » renforce une équipe.
     """
-    s_a = cv_inv_a / max(surv_a, eps)
-    s_b = cv_inv_b / max(surv_b, eps)
+    s_a = cv_inv_a / (max(surv_a, eps) ** beta)
+    s_b = cv_inv_b / (max(surv_b, eps) ** beta)
     total = s_a + s_b
     return 0.5 if total <= 0.0 else s_a / total
 
 
-def generate_bracket_scenario(df_odds, df_tournoi=None):
+def generate_bracket_scenario(df_odds, df_tournoi=None, beta=0.95):
     """
     Simulateur Universel (Avant-tournoi & Horizon Glissant).
+    beta : amortissement de la force conditionnelle (cf. conditional_matchup_prob).
     Génère le bracket Monte-Carlo de base, puis l'écrase avec la réalité 
     si un fichier de tournoi en cours (df_tournoi) est fourni.
     """
@@ -337,8 +351,8 @@ def generate_bracket_scenario(df_odds, df_tournoi=None):
                 
             # 3B. Les cotes du match sont-elles ouvertes ?
             if pd.notna(row.get('cote_1')):
-                inv = 1.0 / np.array([row['cote_1'], row['cote_N'], row['cote_2']])
-                k_p90 = inv / np.sum(inv)
+                k_p90 = calculate_true_outcome_probas_from_odds(
+                    np.array([row['cote_1'], row['cote_N'], row['cote_2']]))
                 k_gains = [row['gain_mpp_1'], row['gain_mpp_N'], row['gain_mpp_2']]
                 c_brut = np.array([row['crowd_1'], row['crowd_N'], row['crowd_2']], dtype=np.float32)
                 k_crowd = c_brut / np.sum(c_brut)
@@ -357,6 +371,7 @@ def generate_bracket_scenario(df_odds, df_tournoi=None):
         base_p_qualif_1 = conditional_matchup_prob(
             id_to_odds.get(t1, 50.0), surv.get(t1, 1.0),
             id_to_odds.get(t2, 50.0), surv.get(t2, 1.0),
+            beta=beta,
         )
         
         # --- APPEL DU MOTEUR MATHÉMATIQUE (Factorisé) ---
@@ -400,8 +415,38 @@ def generate_bracket_scenario(df_odds, df_tournoi=None):
 # ==========================================
 # 3. L'INTÉGRATEUR GÉANT (VERSION FINALE HYBRIDE)
 # ==========================================
+def _resolve_known_pick(known, idx, valid_names, kind):
+    """Résout le choix RÉEL du joueur d'index `idx` dans la liste `known`.
+
+    Renvoie le nom canonique (tel qu'il figure dans `valid_names`, robuste à la
+    casse / aux espaces) si l'entrée est renseignée, sinon None -> pick à tirer
+    selon la foule. `known[i]` = choix du joueur `i` du roster (favoris et buteurs
+    sont des listes alignées sur les mêmes joueurs). La liste peut être incomplète
+    (plus courte que le roster) ou contenir des None (joueur dont le pick est inconnu).
+    """
+    if known is None or idx >= len(known):
+        return None
+    pick = known[idx]
+    if pick is None:
+        return None
+    pick = str(pick).strip()
+    if pick == '':
+        return None
+    if pick in valid_names:
+        return pick
+    lower_map = {str(n).strip().lower(): n for n in valid_names}
+    key = pick.lower()
+    if key in lower_map:
+        return lower_map[key]
+    raise ValueError(
+        f"{kind} imposé '{pick}' (index {idx}) introuvable parmi les choix "
+        f"disponibles : {sorted(valid_names)}"
+    )
+
+
 def compute_robust_endgame_horizon(my_fav, my_scorer, path_poules="data/CDM_2026.csv",
-                                   n_simulations=15, save=True, verbose=True):
+                                   n_simulations=15, save=True, verbose=True, beta=0.95,
+                                   known_favorites=None, known_scorers=None):
     """
     Calcule l'horizon des phases finales pour un portefeuille (favori, buteur) donné.
 
@@ -410,6 +455,15 @@ def compute_robust_endgame_horizon(my_fav, my_scorer, path_poules="data/CDM_2026
     save=False  : ne touche pas au disque (usage validation, ex. recherche du meilleur
                   combo favori/buteur dans le Notebook 16).
     verbose     : journalise la progression (couper pour les boucles sur plusieurs combos).
+
+    known_favorites / known_scorers : listes optionnelles et ALIGNÉES des choix RÉELS du
+        roster d'adversaires — `known_favorites[i]`/`known_scorers[i]` sont le favori et le
+        buteur du joueur `i`. Le roster complet compte `N_PELOTON = N_PLAYERS-1` adversaires.
+        Les listes peuvent être incomplètes (taille < N_PELOTON) ou contenir des None/vides :
+        ces slots inconnus sont complétés par un tirage selon la foule, RE-tiré à chaque run.
+        À chaque run, Bob (gap_1) et le peloton (gap_2) sont DEUX indices de joueurs distincts
+        tirés sans remise dans le roster ; leurs picks viennent du roster ainsi complété.
+        Les noms sont résolus à la casse/aux espaces près (typo -> ValueError).
     """
     if verbose:
         print(f"--- DÉMARRAGE DU CALCUL HORIZON ({n_simulations} arbres) ---")
@@ -462,6 +516,28 @@ def compute_robust_endgame_horizon(my_fav, my_scorer, path_poules="data/CDM_2026
     sco_names = df_sco['selection'].tolist()
     sco_probs = df_sco['estimated_crowd'].values
     n_scorers = len(sco_names)
+
+    # Roster des adversaires : picks RÉELS figés par joueur (None -> tiré selon la foule
+    # à chaque run). known_*[i] = choix du joueur i ; roster complet = N_PELOTON joueurs.
+    if N_PELOTON < 2:
+        raise ValueError(
+            f"N_PELOTON={N_PELOTON} < 2 : impossible de tirer Bob et le peloton distincts. "
+            f"Augmenter N_PLAYERS dans oracle_dp.")
+    for kind, known in (("favorites", known_favorites), ("scorers", known_scorers)):
+        if known is not None and len(known) > N_PELOTON:
+            warnings.warn(
+                f"known_{kind} : {len(known)} entrées > N_PELOTON={N_PELOTON} ; "
+                f"les entrées au-delà du roster sont ignorées.",
+                stacklevel=2,
+            )
+    fav_fixed = [_resolve_known_pick(known_favorites, i, fav_names, "Favori") for i in range(N_PELOTON)]
+    sco_fixed = [_resolve_known_pick(known_scorers, i, sco_names, "Buteur") for i in range(N_PELOTON)]
+    if verbose:
+        n_fav_known = sum(f is not None for f in fav_fixed)
+        n_sco_known = sum(s is not None for s in sco_fixed)
+        print(f"Roster adversaires : {N_PELOTON} joueurs ; favoris connus {n_fav_known}/{N_PELOTON}, "
+              f"buteurs connus {n_sco_known}/{N_PELOTON}. Bob & peloton = 2 indices distincts "
+              f"tirés sans remise/run (slots inconnus complétés selon la foule à chaque run).")
     
     # 2. PRÉ-CALCUL DU PELOTON (Historique Complet 104 matchs)
     p_emp_ref, gains_ref = precompute_diluted_peloton(df_poules, df_odds)
@@ -483,15 +559,18 @@ def compute_robust_endgame_horizon(my_fav, my_scorer, path_poules="data/CDM_2026
     for i in range(n_simulations):
         # A. Tirage du scénario de l'Arbre (Auto-conscient de la réalité)
         match_probs, gains_arbre_actuel, crowds, teams, team_to_id = generate_bracket_scenario(
-            df_odds, df_tournoi=df_poules
+            df_odds, df_tournoi=df_poules, beta=beta
         )
         
-        # B. Tirage des favoris et buteurs de Bob et du Peloton
-        bob_fav = np.random.choice(fav_names, p=fav_probs)
-        pack_fav = np.random.choice(fav_names, p=fav_probs)
-        
-        bob_sco = np.random.choice(sco_names, p=sco_probs)
-        pack_sco = np.random.choice(sco_names, p=sco_probs)
+        # B. Bob (gap_1) et le peloton (gap_2) = 2 joueurs DISTINCTS du roster, tirés sans
+        #    remise. Leur (favori, buteur) = pick réel si connu, sinon tiré selon la foule
+        #    (re-tiré à chaque run pour les slots inconnus).
+        bob_idx, pack_idx = np.random.choice(N_PELOTON, size=2, replace=False)
+        bob_fav = fav_fixed[bob_idx] if fav_fixed[bob_idx] is not None else np.random.choice(fav_names, p=fav_probs)
+        pack_fav = fav_fixed[pack_idx] if fav_fixed[pack_idx] is not None else np.random.choice(fav_names, p=fav_probs)
+
+        bob_sco = sco_fixed[bob_idx] if sco_fixed[bob_idx] is not None else np.random.choice(sco_names, p=sco_probs)
+        pack_sco = sco_fixed[pack_idx] if sco_fixed[pack_idx] is not None else np.random.choice(sco_names, p=sco_probs)
         
         bob_scorer_gains = np.zeros(n_scorers, dtype=np.int32)
         bob_scorer_gains[sco_names.index(bob_sco)] = int(df_sco.loc[df_sco['selection'] == bob_sco, 'gain_mpp'].values[0])
@@ -600,6 +679,115 @@ def compute_robust_endgame_horizon(my_fav, my_scorer, path_poules="data/CDM_2026
     return V_start_1001
 
 
+def simulate_champion_distribution(df_odds, n_runs=200_000, beta=0.95, verbose=True, seed=None):
+    """
+    Simule n_runs tournois complets (poules + bracket) et compte combien de fois
+    chaque équipe est CHAMPIONNE (gagnante de la finale, match 31).
+
+    Reproduit FIDÈLEMENT le modèle d'avancement de generate_bracket_scenario :
+      - poules : proxy Plackett-Luce sur cote_1er + équation des 3èmes sur cote_qualif
+                 (mêmes appels np.random.choice sans remise) ;
+      - knockout : force conditionnelle cv_inv / surv**beta, + bruit N(0, 0.03),
+                 + clip [10·MIN_TRUE_PROBA, MAX_TRUE_PROBA**4], comme la branche
+                 simulée de simulate_knockout_match_math.
+    (Les probas 1N2 / gains / crowd du DP ne sont pas calculées : inutiles ici.)
+
+    Sert à CALIBRER beta : comparer la fréquence empirique de titre de chaque équipe
+    à la probabilité théorique normalisée 1/cote_victoire (cf. notebook 23).
+
+    Retour : (champion_counts (n_teams,), team_names (n_teams,)).
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    team_names = df_odds["team"].astype(str).str.strip().str.lower().values
+    n_teams = len(team_names)
+    cv_inv = (1.0 / df_odds["cote_victoire"].values).astype(np.float64)
+    qualif_inv = (1.0 / df_odds["cote_qualif"].values).astype(np.float64)
+    name_to_id = {n: i for i, n in enumerate(team_names)}
+
+    # Structures de groupes pré-calculées (évite tout pandas dans la boucle)
+    groups = []
+    for _, grp in df_odds.groupby("group"):
+        ids = np.array([name_to_id[str(t).strip().lower()] for t in grp["team"]], dtype=np.int64)
+        w = calculate_true_outcome_probas_from_odds(grp["cote_1er"].values)
+        w = w / w.sum()
+        s1 = grp["slot_1er"].values.astype(np.int64)
+        s2 = grp["slot_2e"].values.astype(np.int64)
+        gamma = max(0.01, (1.0 / grp["cote_qualif"].values).sum() - 2.0)
+        groups.append((ids, w, s1, s2, gamma))
+
+    next_match_map = {0: (16, 0), 1: (16, 1), 2: (17, 0), 3: (17, 1), 4: (18, 0), 5: (18, 1),
+                      6: (19, 0), 7: (19, 1), 8: (20, 0), 9: (20, 1), 10: (21, 0), 11: (21, 1),
+                      12: (22, 0), 13: (22, 1), 14: (23, 0), 15: (23, 1), 16: (24, 0), 17: (24, 1),
+                      18: (25, 0), 19: (25, 1), 20: (26, 0), 21: (26, 1), 22: (27, 0), 23: (27, 1),
+                      24: (28, 0), 25: (28, 1), 26: (29, 0), 27: (29, 1)}
+
+    LO, HI, SIG = 10.0 * MIN_TRUE_PROBA, MAX_TRUE_PROBA ** 4, 0.03
+    counts = np.zeros(n_teams, dtype=np.int64)
+    champion = -1
+
+    for run in range(n_runs):
+        bracket = np.full((32, 2), -1, dtype=np.int64)
+        surv = qualif_inv.copy()  # P(qualifié en 16e) ; réinitialisé chaque tournoi
+
+        # --- Poules ---
+        thirds, thirds_gamma = [], []
+        for (ids, w, s1, s2, gamma) in groups:
+            pick = np.random.choice(4, size=3, replace=False, p=w)
+            first, second, third = ids[pick[0]], ids[pick[1]], ids[pick[2]]
+            for team, slot in ((first, int(s1[pick[0]])), (second, int(s2[pick[1]]))):
+                if bracket[slot, 0] == -1:
+                    bracket[slot, 0] = team
+                else:
+                    bracket[slot, 1] = team
+            thirds.append(third)
+            thirds_gamma.append(gamma)
+        tg = np.array(thirds_gamma)
+        tg = tg / tg.sum()
+        best8 = np.random.choice(12, size=8, replace=False, p=tg)
+        q3 = [thirds[i] for i in best8]
+        np.random.shuffle(q3)
+        qi = 0
+        for m in range(16):
+            for s in range(2):
+                if bracket[m, s] == -1:
+                    bracket[m, s] = q3[qi]
+                    qi += 1
+
+        # --- Knockout ---
+        for m in range(32):
+            t1, t2 = bracket[m, 0], bracket[m, 1]
+            s_a = cv_inv[t1] / surv[t1] ** beta
+            s_b = cv_inv[t2] / surv[t2] ** beta
+            p1 = s_a / (s_a + s_b)
+            p1 = min(HI, max(LO, p1 + np.random.normal(0, SIG)))
+            if np.random.rand() < p1:
+                winner, pw = t1, p1
+            else:
+                winner, pw = t2, 1.0 - p1
+            surv[winner] *= pw
+            if m in next_match_map:
+                nm, slot = next_match_map[m]
+                bracket[nm, slot] = winner
+            elif m == 28:
+                bracket[31, 0] = winner
+                bracket[30, 0] = t2 if winner == t1 else t1
+            elif m == 29:
+                bracket[31, 1] = winner
+                bracket[30, 1] = t2 if winner == t1 else t1
+        champion = winner  # vainqueur de la finale (m = 31, dernier traité)
+        counts[champion] += 1
+
+        if verbose and (run + 1) % max(1, n_runs // 10) == 0:
+            print(f"  {run + 1:,}/{n_runs:,} tournois simulés...")
+
+    return counts, team_names
+
+
 if __name__ == "__main__":
     # Test avec 15 arbres pour être rapide au quotidien (Modifiable le Jour J)
-    compute_robust_endgame_horizon(my_fav="espagne", my_scorer="autre", n_simulations=2)
+    # ~486 s/itération sur CPU (i5-12400) ; 15 itérations = ~1h15 ; 2 itérations = ~10 min.
+    compute_robust_endgame_horizon(my_fav="espagne", my_scorer="autre", n_simulations=67,
+                                   known_favorites=["france", "france", "france", "france", "espagne"],
+                                   known_scorers=  ["autre", "autre", "autre", "harry_kane", "harry_kane"])

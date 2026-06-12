@@ -14,6 +14,7 @@ from mpp_project.bracket_simulator import (
     generate_bracket_scenario,
     poules_horizon_from_full,
     conditional_matchup_prob,
+    simulate_champion_distribution,
 )
 from tests.helpers import DATA_DIR
 
@@ -171,3 +172,28 @@ def test_matchup_boost_apres_avoir_battu_un_cador():
     p_cond = conditional_matchup_prob(0.05, 0.2, 0.15, 0.8)
     assert p_cond > p_brut
     assert p_cond > 0.5
+
+
+def test_matchup_beta_amortit_le_boost():
+    """beta amortit le conditionnement : beta=0 -> ratio brut ; 0<beta<1 -> partiel."""
+    cvA, survA, cvB, survB = 0.05, 0.2, 0.15, 0.8
+    p_full = conditional_matchup_prob(cvA, survA, cvB, survB, beta=1.0)
+    p_half = conditional_matchup_prob(cvA, survA, cvB, survB, beta=0.5)
+    p_none = conditional_matchup_prob(cvA, survA, cvB, survB, beta=0.0)
+    assert p_none == pytest.approx(0.25)        # beta=0 -> surv**0=1 -> ratio brut des cv
+    assert p_full > p_half > p_none             # amortissement monotone
+
+
+# ---------------------------------------------------------------------------
+# simulate_champion_distribution (calibration de beta)
+# ---------------------------------------------------------------------------
+def test_simulate_champion_distribution(df_odds):
+    counts, names = simulate_champion_distribution(df_odds, n_runs=3000, beta=1.0,
+                                                   verbose=False, seed=0)
+    assert counts.shape == (48,)
+    assert counts.sum() == 3000
+    assert np.all(counts >= 0)
+    # Le favori (plus petite cote_victoire) est sacré bien plus souvent qu'un outsider extrême
+    fav_id = int(np.argmin(df_odds['cote_victoire'].values))
+    long_id = int(np.argmax(df_odds['cote_victoire'].values))
+    assert counts[fav_id] > counts[long_id]
