@@ -386,7 +386,7 @@ def solve_dp_coarse(base_true_probas, base_crowds, gains_1N2, p_empirique_1D, al
     Couvre le même range [-600, +400] mais avec résolution 2 pts → 4× plus rapide
     (moins d'états + V_next 2 MB au lieu de 8 MB → meilleure localité cache).
 
-    V_horizon doit être de shape (501, 501, 2)  ← downsampler depuis (1001, 1001, 2) avec [::2, ::2].
+    V_horizon doit être de shape (501, 501, 2)  <- downsampler depuis (1001, 1001, 2) avec [::2, ::2].
     Retourne V_all_matches de shape (n_matches, 501, 501, 2).
 
     Convention : val_g = g - 300  représente le gap en "demi-points".
@@ -526,6 +526,219 @@ def solve_dp_coarse(base_true_probas, base_crowds, gains_1N2, p_empirique_1D, al
     return V_all_matches, Q_tables
 
 
+# ==========================================================================
+# DP coarse EXACT-AWARE : scores exacts sur les matchs renseignés, 1N2 sinon
+# ==========================================================================
+@njit
+def _lk_coarse(val_g1, val_g2, ap, bob_g, pel_delta, alpha, V_next, layer):
+    """Lookup coarse (demi-points, clamp [0,500], offset 300) — cf. solve_dp_coarse."""
+    ngb = val_g1 + ap - bob_g
+    ngp = val_g2 + ap - pel_delta
+    vg1 = min(ngb, ngp)
+    vg2 = alpha * max(ngb, ngp) + (1.0 - alpha) * ngp
+    i1 = max(0, min(500, int(round(vg1)) + 300))
+    i2 = max(0, min(500, int(round(vg2)) + 300))
+    return V_next[i1, i2, layer]
+
+
+@njit
+def _esp_coarse_exact(val_g1, val_g2, ap_norm, ap_boost, o, cc, b_half,
+                      true_gain, crowd, hist, alpha, V_next):
+    """
+    Sommes Bob×peloton (coarse) de la valeur future pour des points agent fixés
+    (ap_norm pour base/keep, ap_boost = 2·ap_norm pour use). Bob et le peloton
+    peuvent décrocher le bonus du score RÉEL (b_half, déjà /2) avec proba cc.
+    Renvoie (esp_b0, esp_keep, esp_use). Avec cc=0 et b_half=0 -> transition 1N2.
+    """
+    max_gain = hist.shape[0]
+    esp_b0 = 0.0
+    esp_keep = 0.0
+    esp_use = 0.0
+    for bob_a in range(3):
+        p_bob = crowd[bob_a]
+        if p_bob == 0.0:
+            continue
+        bob_correct = (bob_a == o)
+        for bob_branch in range(2):
+            if bob_correct:
+                if bob_branch == 0:
+                    p_bb = p_bob * cc
+                    bob_g = true_gain + b_half
+                else:
+                    p_bb = p_bob * (1.0 - cc)
+                    bob_g = true_gain
+            else:
+                if bob_branch == 1:
+                    continue
+                p_bb = p_bob
+                bob_g = 0.0
+            if p_bb == 0.0:
+                continue
+            for dg in range(max_gain):
+                p_pel = hist[dg]
+                if p_pel == 0.0:
+                    continue
+                dgc = dg / 2.0
+                if dg != 0:
+                    for pel_branch in range(2):
+                        if pel_branch == 0:
+                            p_pb = p_pel * cc
+                            pel_delta = dgc + b_half
+                        else:
+                            p_pb = p_pel * (1.0 - cc)
+                            pel_delta = dgc
+                        if p_pb == 0.0:
+                            continue
+                        w = p_bb * p_pb
+                        esp_b0 += w * _lk_coarse(val_g1, val_g2, ap_norm, bob_g, pel_delta, alpha, V_next, 0)
+                        esp_keep += w * _lk_coarse(val_g1, val_g2, ap_norm, bob_g, pel_delta, alpha, V_next, 1)
+                        esp_use += w * _lk_coarse(val_g1, val_g2, ap_boost, bob_g, pel_delta, alpha, V_next, 0)
+                else:
+                    w = p_bb * p_pel
+                    pel_delta = dgc  # = 0.0
+                    esp_b0 += w * _lk_coarse(val_g1, val_g2, ap_norm, bob_g, pel_delta, alpha, V_next, 0)
+                    esp_keep += w * _lk_coarse(val_g1, val_g2, ap_norm, bob_g, pel_delta, alpha, V_next, 1)
+                    esp_use += w * _lk_coarse(val_g1, val_g2, ap_boost, bob_g, pel_delta, alpha, V_next, 0)
+    return esp_b0, esp_keep, esp_use
+
+
+@njit(parallel=True)
+def solve_dp_coarse_exact(sc_outcome, sc_p, sc_cc, sc_bonus, sc_count,
+                          gains_1N2, crowd_1N2, p_empirique_1D, alphas_isolement,
+                          V_horizon, stop_t=0, start_t=-1):
+    """
+    Variante EXACT-AWARE de solve_dp_coarse (501², demi-points). Chaque match `t`
+    porte K_t « scores » (paddés) : 1N2 -> 3 pseudo-scores (outcomes 0/1/2, bonus 0) ;
+    match renseigné -> les scores exacts (outcome, p ancrée, cond_crowd, bonus). La
+    transition est celle de evaluate_exact_score_day, sur toute la grille.
+
+    Tableaux paddés (n_matches, Kmax) : sc_outcome (int8), sc_p (f8), sc_cc (f8),
+    sc_bonus (f8, points PLEINS — divisés par 2 en interne), sc_count (n,) int.
+    gains_1N2 (n,3) PLEINS (/2 interne), crowd_1N2 (n,3), p_empirique_1D (n,3,max_gain),
+    alphas_isolement (n,), V_horizon (501,501,2). Conventions start_t IDENTIQUES à
+    solve_dp_coarse (PIÈGE : start_t=n_matches pour CHAÎNER un horizon sans l'écraser).
+
+    Optimisation (effondre le facteur K_action, exact) : pour chaque score RÉEL ks,
+    les points agent ne prennent que 3 valeurs (mauvais outcome / bon outcome raté /
+    score exact) ; on calcule les sommes Bob×peloton pour ces 3 niveaux puis on
+    assemble la valeur de chaque action.
+
+    Renvoie V_all_matches (n_matches, 501, 501, 2).
+    """
+    n_matches = sc_outcome.shape[0]
+    Kmax = sc_outcome.shape[1]
+
+    V_all_matches = np.zeros((n_matches, 501, 501, 2), dtype=np.float32)
+    V_next = np.copy(V_horizon)
+
+    # 1. Condition terminale (run complet uniquement)
+    if start_t < 0:
+        for g1 in range(501):
+            val_g1 = g1 - 300
+            for g2 in range(g1, 501):
+                val_g2 = g2 - 300
+                if val_g1 > 0 and val_g2 > 0:
+                    win_prob = 1.0
+                elif (val_g1 == 0 and val_g2 > 0) or (val_g1 > 0 and val_g2 == 0):
+                    win_prob = 0.5
+                elif val_g1 == 0 and val_g2 == 0:
+                    win_prob = 1.0 / 3.0
+                else:
+                    win_prob = 0.0
+                V_next[g1, g2, 0] = win_prob
+                V_next[g1, g2, 1] = win_prob
+
+    if start_t < 0:
+        t_debut = n_matches - 1
+    else:
+        t_debut = start_t - 1
+
+    for t in range(t_debut, stop_t - 1, -1):
+        V_current = np.zeros((501, 501, 2), dtype=np.float32)
+        K = sc_count[t]
+        alpha = alphas_isolement[t]
+        gains_t = gains_1N2[t]
+        crowd_t = crowd_1N2[t]
+        hist_t = p_empirique_1D[t]
+
+        for g1 in prange(501):
+            val_g1 = g1 - 300
+            # Buffers réutilisés sur la ligne g1 (alloués hors boucle g2)
+            Ain = np.zeros((3, 3), dtype=np.float64)
+            Bin_ = np.zeros((3, 3), dtype=np.float64)
+            dC = np.zeros((Kmax, 3), dtype=np.float64)
+
+            for g2 in range(g1, 501):
+                val_g2 = g2 - 300
+
+                for ii in range(3):
+                    for jj in range(3):
+                        Ain[ii, jj] = 0.0
+                        Bin_[ii, jj] = 0.0
+                totalA0 = 0.0
+                totalA1 = 0.0
+                totalA2 = 0.0
+
+                for ks in range(K):
+                    o = sc_outcome[t, ks]
+                    p_s = sc_p[t, ks]
+                    cc = sc_cc[t, ks]
+                    b_half = sc_bonus[t, ks] / 2.0
+                    gh = gains_t[o] / 2.0
+                    hist_o = hist_t[o]
+
+                    # case A : agent mauvais outcome -> AP=0
+                    a0, ak, au = _esp_coarse_exact(val_g1, val_g2, 0.0, 0.0, o, cc, b_half,
+                                                   gh, crowd_t, hist_o, alpha, V_next)
+                    # case B : bon outcome, score raté -> AP=gh
+                    b0, bk, bu = _esp_coarse_exact(val_g1, val_g2, gh, 2.0 * gh, o, cc, b_half,
+                                                   gh, crowd_t, hist_o, alpha, V_next)
+                    # case C : score exact -> AP=gh+b_half
+                    apc = gh + b_half
+                    c0, ck, cu = _esp_coarse_exact(val_g1, val_g2, apc, 2.0 * apc, o, cc, b_half,
+                                                   gh, crowd_t, hist_o, alpha, V_next)
+
+                    totalA0 += p_s * a0
+                    totalA1 += p_s * ak
+                    totalA2 += p_s * au
+                    Ain[o, 0] += p_s * a0
+                    Ain[o, 1] += p_s * ak
+                    Ain[o, 2] += p_s * au
+                    Bin_[o, 0] += p_s * b0
+                    Bin_[o, 1] += p_s * bk
+                    Bin_[o, 2] += p_s * bu
+                    dC[ks, 0] = p_s * (c0 - b0)
+                    dC[ks, 1] = p_s * (ck - bk)
+                    dC[ks, 2] = p_s * (cu - bu)
+
+                best_b0 = 0.0
+                best_b1 = 0.0
+                for ka in range(K):
+                    ao = sc_outcome[t, ka]
+                    v_b0 = totalA0 - Ain[ao, 0] + Bin_[ao, 0] + dC[ka, 0]
+                    v_keep = totalA1 - Ain[ao, 1] + Bin_[ao, 1] + dC[ka, 1]
+                    v_use = totalA2 - Ain[ao, 2] + Bin_[ao, 2] + dC[ka, 2]
+                    if v_b0 > best_b0:
+                        best_b0 = v_b0
+                    bb1 = max(v_keep, v_use)
+                    if bb1 > best_b1:
+                        best_b1 = bb1
+
+                V_current[g1, g2, 0] = best_b0
+                V_current[g1, g2, 1] = best_b1
+
+        # Symétrie (triangle inférieur)
+        for g1 in prange(501):
+            for g2 in range(g1 + 1, 501):
+                V_current[g2, g1, 0] = V_current[g1, g2, 0]
+                V_current[g2, g1, 1] = V_current[g1, g2, 1]
+
+        V_next = V_current
+        V_all_matches[t] = V_current
+
+    return V_all_matches
+
+
 @njit(parallel=True)
 def compute_full_Q_table(t, t_prob, c_rep, t_gains, p_empirique_1D, alpha, V_next, max_gain):
     
@@ -631,11 +844,17 @@ def _lookup_V(val_g1, val_g2, agent_pts, bob_g, pel_delta, alpha, V_next, layer)
 
 @njit
 def evaluate_exact_score_day(g1_idx, g2_idx, sc_outcome, sc_p, sc_cc, sc_bonus,
-                             gains_1N2, crowd_1N2, p_empirique_day, alpha, V_next):
+                             gains_1N2, crowd_1N2, p_empirique_day, alpha, V_next,
+                             agent_bonus_factor=1.0):
     """
     Évalue, à l'état courant (g1_idx, g2_idx), le win rate de CHAQUE action de
     score exact pour le match du jour, en chaînant vers V_next (post-jour, fine
     1001x1001x2). Renvoie Q de shape (K, 3) : colonnes [base, keep, use].
+
+    `agent_bonus_factor` (défaut 1.0) multiplie le bonus que l'AGENT touche quand
+    son score sort. Mettre 0.0 donne le WR « si l'agent loupe son score exact »
+    (il ne compte que sur le gain d'outcome) — Bob et le peloton gardent leur
+    bonus dans tous les cas. Sert à afficher le plancher robuste du pari.
 
     Paramètres alignés (K = nb de scores listés) :
       sc_outcome (K,) issue 1N2 du score, sc_p (K,) proba vraie, sc_cc (K,) crowd
@@ -674,7 +893,7 @@ def evaluate_exact_score_day(g1_idx, g2_idx, sc_outcome, sc_p, sc_cc, sc_bonus,
 
             # Points de l'agent : gain d'outcome si bon outcome, + bonus si score exact
             agent_outcome_gain = true_gain if a_o == o else 0.0
-            agent_bonus = a_bonus if ka == ks else 0.0   # ka==ks => a_o==o
+            agent_bonus = (a_bonus * agent_bonus_factor) if ka == ks else 0.0   # ka==ks => a_o==o
             agent_pts_norm = agent_outcome_gain + agent_bonus
             agent_pts_boost = 2.0 * agent_pts_norm
 

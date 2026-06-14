@@ -806,6 +806,25 @@ def expected_simple_points(market: ExactScoreMarket) -> np.ndarray:
     return E
 
 
+def expected_mpp_points(market: ExactScoreMarket, gains_1N2) -> np.ndarray:
+    """
+    Espérance de points MPP RÉELS de chaque score listé (hors booster) :
+        E[pts] = P(bon outcome) * gain_mpp[outcome] + P(score exact) * bonus
+
+    P(bon outcome) = somme des probas des scores du même outcome (= P(o) ancré) ;
+    P(score exact) = `market.p_score` du score ; `bonus` = barème exact_score_bonus.
+    Le booster ×2 doublerait cette valeur (cf. WR x2). Array (K,) aligné sur scores.
+    """
+    outcomes = np.asarray(market.outcomes)
+    p = np.asarray(market.p_score, dtype=float)
+    bonus = np.asarray(market.bonus, dtype=float)
+    gains = np.asarray(gains_1N2, dtype=float)
+
+    p_outcome = np.array([p[outcomes == o].sum() for o in (0, 1, 2)])
+    E_gain = p_outcome[outcomes] * gains[outcomes]
+    return E_gain + p * bonus
+
+
 def load_exact_scores(csv_path, match_id) -> dict:
     """
     Charge les scores exacts d'un match depuis un CSV (colonnes `match_id, score,
@@ -837,3 +856,30 @@ def load_exact_scores(csv_path, match_id) -> dict:
         crowd = None if pd.isna(r["crowd"]) else float(r["crowd"])
         data[str(r["score"]).strip()] = (cote, crowd)
     return data
+
+
+def load_exact_scores_by_match(csv_path) -> dict:
+    """
+    Charge TOUS les matchs du CSV des scores exacts et renvoie un dict-of-dicts
+    `{ match_id (int): { "b1-b2": (cote, crowd) } }`. Sert au mode multi-matchs
+    (`run_daily_pipeline(exact_scores_by_match=...)`) : la décision du match courant
+    devient « exact-aware » sur tous les matchs de la nuit présents dans le CSV, et
+    on obtient une reco par match.
+
+    Même conventions que `load_exact_scores` (NaN -> None). Lève ValueError si
+    colonnes manquantes.
+    """
+    df = pd.read_csv(csv_path)
+    required = {"match_id", "score", "cote", "crowd"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"load_exact_scores_by_match : colonnes manquantes {sorted(missing)} dans {csv_path}."
+        )
+    by_match = {}
+    for _, r in df.iterrows():
+        mid = int(r["match_id"])
+        cote = None if pd.isna(r["cote"]) else float(r["cote"])
+        crowd = None if pd.isna(r["crowd"]) else float(r["crowd"])
+        by_match.setdefault(mid, {})[str(r["score"]).strip()] = (cote, crowd)
+    return by_match

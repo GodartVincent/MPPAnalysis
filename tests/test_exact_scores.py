@@ -19,12 +19,17 @@ from mpp_project.core import (
     ExactScoreMarket,
     build_exact_score_market,
     exact_score_bonus,
+    expected_mpp_points,
     expected_simple_points,
     load_exact_scores,
 )
-from mpp_project.oracle_dp import evaluate_exact_score_day, GAP_OFFSET, GAP_MIN, GAP_MAX
+from mpp_project.core import load_exact_scores_by_match
+from mpp_project.oracle_dp import (
+    evaluate_exact_score_day, solve_dp_coarse, solve_dp_coarse_exact,
+    GAP_OFFSET, GAP_MIN, GAP_MAX,
+)
 from mpp_project.daily_pipeline import run_daily_pipeline
-from tests.helpers import build_pipeau_dataframe, build_terminal_horizon
+from tests.helpers import build_pipeau_dataframe, build_ghost_peloton, build_terminal_horizon
 
 TOL = 1e-4
 
@@ -108,6 +113,21 @@ def test_expected_simple_points():
     # "2-1"(o0,d1): 2*.4 + 3*.3 + 0 = 1.7
     # "0-1"(o2,d-1): 0 + 0 + 3*.3 = 0.9
     assert E == pytest.approx([1.8, 1.7, 0.9], abs=1e-9)
+
+
+def test_expected_mpp_points():
+    """E[pts MPP] = P(outcome)*gain_mpp[outcome] + P(score exact)*bonus."""
+    m = ExactScoreMarket(
+        scores=["1-0", "2-1", "0-1"],
+        outcomes=np.array([0, 0, 2], dtype=np.int8),
+        p_score=np.array([0.4, 0.3, 0.3]),
+        cond_crowd=np.zeros(3),
+        bonus=np.array([10, 20, 30], dtype=np.int64),
+    )
+    E = expected_mpp_points(m, gains_1N2=np.array([50, 40, 60]))
+    # P(o0)=0.7, P(o2)=0.3
+    # "1-0": 0.7*50 + 0.4*10 = 39 ; "2-1": 0.7*50 + 0.3*20 = 41 ; "0-1": 0.3*60 + 0.3*30 = 27
+    assert E == pytest.approx([39.0, 41.0, 27.0], abs=1e-9)
 
 
 # ===========================================================================
@@ -280,6 +300,28 @@ def test_evaluate_vs_bruteforce(synthetic_market, synthetic_hist, g1, g2):
     assert np.allclose(Q, Q_ref, atol=TOL), f"écart max {np.abs(Q - Q_ref).max():.2e}"
 
 
+def test_no_bonus_wr_is_floor(synthetic_market, synthetic_hist):
+    """agent_bonus_factor=0 (l'agent loupe son score) : WR <= WR avec bonus, et
+    identique pour tous les scores d'un même outcome (ne dépend que de l'outcome)."""
+    m = synthetic_market
+    gains = np.array([50.0, 36.0, 45.0])
+    crowd = np.array([0.45, 0.30, 0.25])
+    V_next = build_terminal_horizon()
+    g1_idx, g2_idx = -40 + GAP_OFFSET, GAP_OFFSET
+
+    full = evaluate_exact_score_day(g1_idx, g2_idx, m.outcomes, m.p_score, m.cond_crowd,
+                                    m.bonus, gains, crowd, synthetic_hist, 0.4, V_next)
+    nb = evaluate_exact_score_day(g1_idx, g2_idx, m.outcomes, m.p_score, m.cond_crowd,
+                                  m.bonus, gains, crowd, synthetic_hist, 0.4, V_next,
+                                  agent_bonus_factor=0.0)
+
+    assert np.all(nb <= full + 1e-6), "retirer le bonus agent ne peut pas augmenter le WR"
+    for o in (0, 1, 2):
+        idx = np.where(m.outcomes == o)[0]
+        if len(idx) > 1:
+            assert np.allclose(nb[idx], nb[idx[0]], atol=1e-6), f"WR sans bonus non constant sur outcome {o}"
+
+
 def test_evaluate_booster_value(synthetic_market, synthetic_hist):
     """Avec booster, max(keep, use) sur les actions >= meilleur WR base."""
     m = synthetic_market
@@ -341,3 +383,99 @@ def test_pipeline_integration_exact(tmp_path):
         assert market_df[col].between(0.0, 100.0).all()
     # Q 1N2 du jour toujours renvoyée en slot 4
     assert q_jour.shape == (1001, 1001, 3, 3)
+
+
+# ===========================================================================
+# 4. MULTI-MATCHS : DP coarse exact-aware + reco par match
+# ===========================================================================
+def test_load_exact_scores_by_match(tmp_path):
+    df = pd.DataFrame({
+        "match_id": [3, 3, 4, 4],
+        "score": ["1-0", "0-1", "2-0", "1-1"],
+        "cote": [6.5, 12.0, 8.0, np.nan],
+        "crowd": [15.0, 8.0, 18.0, np.nan],
+    })
+    path = tmp_path / "exact_scores.csv"
+    df.to_csv(path, index=False)
+
+    by_match = load_exact_scores_by_match(path)
+    assert set(by_match.keys()) == {3, 4}
+    assert by_match[3]["1-0"] == (6.5, 15.0)
+    assert by_match[4]["1-1"] == (None, None)
+
+
+def _coarse_1N2_sc(true_probas):
+    """Tableaux de scores paddés représentant des matchs 1N2 purs (bonus 0)."""
+    n = true_probas.shape[0]
+    sc_o = np.zeros((n, 3), dtype=np.int8)
+    sc_o[:, 1] = 1
+    sc_o[:, 2] = 2
+    sc_p = np.ascontiguousarray(true_probas, dtype=np.float64)
+    sc_cc = np.zeros((n, 3), dtype=np.float64)
+    sc_b = np.zeros((n, 3), dtype=np.float64)
+    sc_n = np.full(n, 3, dtype=np.int64)
+    return sc_o, sc_p, sc_cc, sc_b, sc_n
+
+
+def test_coarse_exact_equals_coarse_1N2():
+    """RÉGRESSION CRITIQUE : solve_dp_coarse_exact avec entrées tout-1N2 (bonus 0)
+    reproduit solve_dp_coarse sur le même scénario."""
+    n, max_gain = 3, 20
+    tp = np.array([[0.50, 0.30, 0.20]] * n, dtype=np.float64)
+    cr = np.array([[0.45, 0.35, 0.20]] * n, dtype=np.float64)
+    ga = np.array([[40, 30, 50]] * n, dtype=np.float64)
+    hist = np.zeros((n, 3, max_gain), dtype=np.float64)
+    hist[:, :, 0] = 0.5
+    hist[:, :, 6] = 0.5
+    al = np.full(n, 0.3, dtype=np.float64)
+    V0 = np.zeros((501, 501, 2), dtype=np.float32)  # écrasé par le terminal (start_t=-1)
+
+    sc_o, sc_p, sc_cc, sc_b, sc_n = _coarse_1N2_sc(tp)
+    V_exact = solve_dp_coarse_exact(sc_o, sc_p, sc_cc, sc_b, sc_n, ga, cr, hist, al,
+                                    V0, stop_t=0, start_t=-1)
+    V_ref, _ = solve_dp_coarse(tp, cr, ga, hist, al, V0, stop_t=0, horizon_nuit=0, start_t=-1)
+
+    assert np.allclose(V_exact, V_ref, atol=1e-4), f"écart max {np.abs(V_exact - V_ref).max():.2e}"
+
+
+MULTI_DATA = {
+    1: {"1-0": (3.0, 30.0), "2-0": (6.0, 10.0), "0-0": (8.0, 15.0), "0-1": (7.0, 12.0)},
+    2: {"1-0": (3.0, 30.0), "1-1": (5.0, 25.0), "0-1": (7.0, 20.0)},
+}
+
+
+def test_pipeline_multi_exact(tmp_path):
+    df = build_pipeau_dataframe(
+        n_matchs=4,
+        true_proba=np.array([0.50, 0.30, 0.20]),
+        crowd=np.array([0.45, 0.30, 0.25]),
+        gains=np.array([50, 40, 60], dtype=np.int64),
+    )
+    path = tmp_path / "multi.csv"
+    df.to_csv(path, index=False)
+
+    out = run_daily_pipeline(
+        csv_path=path,
+        match_id_cible=1,
+        mon_gap_1=-30,
+        mon_gap_2=0,
+        has_booster=1,
+        use_drift=False,
+        horizon_nuit=2,
+        nb_scenarios=1,
+        p_empirique_override=build_ghost_peloton(4, max_gain=250),
+        v_horizon_override=build_terminal_horizon(),
+        save_abaques=False,
+        validate_input=False,
+        exact_scores_by_match=MULTI_DATA,
+    )
+    assert len(out) == 5, "le mode multi-matchs renvoie 5 éléments"
+    reco, wr, market_df, q_jour, night_markets = out
+
+    assert set(night_markets.keys()) == {1, 2}
+    for mid, (reco_m, wr_m, df_m) in night_markets.items():
+        assert reco_m.split(" ")[0] in set(MULTI_DATA[mid].keys())
+        assert 0.0 <= wr_m <= 1.0
+        assert {"Score", "WR base (%)", "WR outcome (%)", "E[pts MPP]"} <= set(df_m.columns)
+    # le 1er élément = reco du match courant (id=1)
+    assert (reco, wr) == (night_markets[1][0], night_markets[1][1])

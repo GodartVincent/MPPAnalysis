@@ -1,9 +1,10 @@
 import numpy as np
 import pandas as pd
+from collections import OrderedDict
 from pathlib import Path
 
-from mpp_project.core import apply_heteroscedastic_noise, apply_temporal_drift, build_exact_score_market, calculate_true_outcome_probas_from_odds, estimate_crowd_3D, expected_simple_points, normalize_crowds, validate_match_dataframe
-from mpp_project.oracle_dp import compute_alphas_isolement, compute_full_Q_table, evaluate_exact_score_day, solve_dp_coarse, GAP_MIN, GAP_MAX, GAP_OFFSET
+from mpp_project.core import apply_heteroscedastic_noise, apply_temporal_drift, build_exact_score_market, calculate_true_outcome_probas_from_odds, estimate_crowd_3D, expected_mpp_points, expected_simple_points, normalize_crowds, validate_match_dataframe
+from mpp_project.oracle_dp import compute_alphas_isolement, compute_full_Q_table, evaluate_exact_score_day, solve_dp_coarse, solve_dp_coarse_exact, GAP_MIN, GAP_MAX, GAP_OFFSET
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_DIR / "data"
@@ -23,7 +24,8 @@ def run_daily_pipeline(
     v_horizon_override=None,
     save_abaques: bool = True,
     validate_input: bool = True,
-    exact_score_data=None
+    exact_score_data=None,
+    exact_scores_by_match=None
 ):
     """
     Exécute la chaîne de décision (Drift + DP) et sauvegarde les abaques des prochains matchs.
@@ -52,6 +54,16 @@ def run_daily_pipeline(
                                  reco = score exact (+ " x2"), market_df = pandas DataFrame
                                  (score/outcome/proba/cond_crowd/bonus/WR_base/keep/use).
                              Q_table_jour reste la Q 1N2 du jour (projection / fallback).
+      exact_scores_by_match : dict { match_id (int) : { "b1-b2": (cote, crowd) } } optionnel.
+                             Mode MULTI-MATCHS « nuit » : la DP proche devient exact-aware sur
+                             tous les matchs de la nuit présents (Bob/peloton décrochent leur
+                             bonus, l'agent optimise son score) -> la décision du match courant
+                             en hérite. En plus, une reco score-exact est calculée pour CHAQUE
+                             match de la nuit dans l'horizon. Le match courant DOIT être une clé.
+                             Retour à 5 éléments :
+                               (reco, best_wr, market_df, Q_table_jour, night_markets)
+                             night_markets = OrderedDict { match_id : (reco_m, wr_m, market_df_m) }
+                             (inclut le match courant). Prioritaire sur exact_score_data.
     """
     match_idx = match_id_cible - 1
 
@@ -120,6 +132,53 @@ def run_daily_pipeline(
     split_t = match_idx + near_horizon
     use_split = use_drift and (split_t < n_matches)
 
+    # --- Setup MODE MULTI-MATCHS (scores exacts sur la nuit) ---
+    # Construit un ExactScoreMarket par match de la nuit (ancré sur le 1N2 du CSV) et
+    # prépare des tableaux de scores paddés pour la DP proche exact-aware. Un match 1N2
+    # = 3 pseudo-scores (bonus 0) -> la transition retombe sur le comportement 1N2.
+    exact_multi = exact_scores_by_match is not None
+    markets_by_idx = {}
+    Kmax = 3
+    if exact_multi:
+        for mid, data in exact_scores_by_match.items():
+            idx = int(mid) - 1
+            if idx < match_idx or idx >= n_matches:
+                continue  # match déjà joué ou hors tournoi
+            mkt = build_exact_score_market(data, outcome_probas=base_true_probas[idx])
+            markets_by_idx[idx] = mkt
+            Kmax = max(Kmax, len(mkt.scores))
+        if match_idx not in markets_by_idx:
+            raise ValueError(
+                f"exact_scores_by_match : le match courant (id={match_id_cible}) doit "
+                f"figurer dans le CSV des scores exacts."
+            )
+
+    gains_f = gains_1N2.astype(np.float64) if exact_multi else None
+    pemp_f = p_empirique_1D.astype(np.float64) if exact_multi else None
+
+    def _build_sc(true_probas):
+        """Tableaux paddés (n_matches, Kmax) : exact si match renseigné, sinon pseudo-1N2."""
+        sc_outcome = np.zeros((n_matches, Kmax), dtype=np.int8)
+        sc_p = np.zeros((n_matches, Kmax), dtype=np.float64)
+        sc_cc = np.zeros((n_matches, Kmax), dtype=np.float64)
+        sc_bonus = np.zeros((n_matches, Kmax), dtype=np.float64)
+        sc_count = np.zeros(n_matches, dtype=np.int64)
+        for t in range(n_matches):
+            if t in markets_by_idx:
+                m = markets_by_idx[t]
+                K = len(m.scores)
+                sc_outcome[t, :K] = np.asarray(m.outcomes, dtype=np.int8)
+                sc_p[t, :K] = m.p_score
+                sc_cc[t, :K] = m.cond_crowd
+                sc_bonus[t, :K] = m.bonus
+                sc_count[t] = K
+            else:
+                sc_outcome[t, 1] = 1
+                sc_outcome[t, 2] = 2
+                sc_p[t, :3] = true_probas[t]
+                sc_count[t] = 3
+        return sc_outcome, sc_p, sc_cc, sc_bonus, sc_count
+
     # --- Phase 1 : DP LOINTAIN coarse (avec drift × nb_scenarios) ---
     # Drift fort sur les matchs lointains (alpha_bayes ≈ 0 → rmse ≈ 8%).
     # nb_scenarios réalisations → E[V(split_t)] en grille coarse (501, 501).
@@ -152,17 +211,25 @@ def run_daily_pipeline(
     # Drift quasi nul sur les matchs proches (alpha_bayes ≈ 0.95 → rmse ≈ 0.4%).
     # Condition limite = V_far_avg (incertitude future déjà encodée).
     if use_split:
-        V_near, _ = solve_dp_coarse(
-            base_true_probas=base_true_probas,
-            base_crowds=base_crowds,
-            gains_1N2=gains_1N2,
-            p_empirique_1D=p_empirique_1D,
-            alphas_isolement=base_alphas,
-            V_horizon=V_far_avg,
-            stop_t=match_idx,
-            horizon_nuit=0,
-            start_t=split_t   # Run partiel : split_t-1 → match_idx
-        )
+        if exact_multi:
+            sc_o, sc_p, sc_cc, sc_b, sc_n = _build_sc(base_true_probas)
+            V_near = solve_dp_coarse_exact(
+                sc_o, sc_p, sc_cc, sc_b, sc_n,
+                gains_f, base_crowds.astype(np.float64), pemp_f, base_alphas.astype(np.float64),
+                V_far_avg, stop_t=match_idx, start_t=split_t
+            )
+        else:
+            V_near, _ = solve_dp_coarse(
+                base_true_probas=base_true_probas,
+                base_crowds=base_crowds,
+                gains_1N2=gains_1N2,
+                p_empirique_1D=p_empirique_1D,
+                alphas_isolement=base_alphas,
+                V_horizon=V_far_avg,
+                stop_t=match_idx,
+                horizon_nuit=0,
+                start_t=split_t   # Run partiel : split_t-1 → match_idx
+            )
         # V_near shape : (n_matches, 501, 501, 2) — on extrait les tranches d'horizon.
         # Pour le dernier match du tournoi, V[n_matches] = condition terminale.
         V_nexts_avg_coarse = np.stack([
@@ -180,17 +247,25 @@ def run_daily_pipeline(
                 v_true_probas = base_true_probas.copy()
                 v_crowds = base_crowds.copy()
             v_alphas = compute_alphas_isolement(v_true_probas, v_crowds, gains_1N2, seuil_isolement=seuil_isolement)
-            V_near_s, _ = solve_dp_coarse(
-                base_true_probas=v_true_probas,
-                base_crowds=v_crowds,
-                gains_1N2=gains_1N2,
-                p_empirique_1D=p_empirique_1D,
-                alphas_isolement=v_alphas,
-                V_horizon=V_next_base_coarse,
-                stop_t=match_idx,
-                horizon_nuit=0,
-                start_t=n_matches   # chaîne vers l'horizon knockout (cf. run lointain)
-            )
+            if exact_multi:
+                sc_o, sc_p, sc_cc, sc_b, sc_n = _build_sc(v_true_probas)
+                V_near_s = solve_dp_coarse_exact(
+                    sc_o, sc_p, sc_cc, sc_b, sc_n,
+                    gains_f, v_crowds.astype(np.float64), pemp_f, v_alphas.astype(np.float64),
+                    V_next_base_coarse, stop_t=match_idx, start_t=n_matches
+                )
+            else:
+                V_near_s, _ = solve_dp_coarse(
+                    base_true_probas=v_true_probas,
+                    base_crowds=v_crowds,
+                    gains_1N2=gains_1N2,
+                    p_empirique_1D=p_empirique_1D,
+                    alphas_isolement=v_alphas,
+                    V_horizon=V_next_base_coarse,
+                    stop_t=match_idx,
+                    horizon_nuit=0,
+                    start_t=n_matches   # chaîne vers l'horizon knockout (cf. run lointain)
+                )
             for k in range(horizon_effectif):
                 nxt = match_idx + k + 1
                 V_nexts_sum[k] += V_near_s[nxt] if nxt < n_matches else V_next_base_coarse
@@ -232,7 +307,30 @@ def run_daily_pipeline(
     g2_idx = max(GAP_MIN, min(GAP_MAX, int(round(mon_gap_2)))) + GAP_OFFSET
     noms_choix = ["1 (Dom)", "N (Nul)", "2 (Ext)"]
 
-    # --- Mode SCORES EXACTS (match du jour) ---
+    # --- Mode MULTI-MATCHS (scores exacts sur la nuit) ---
+    if exact_multi:
+        night_markets = OrderedDict()
+        for idx in sorted(markets_by_idx):
+            k = idx - match_idx
+            if k >= horizon_effectif:
+                import warnings
+                warnings.warn(
+                    f"Match id={idx + 1} hors horizon (k={k} >= horizon_nuit "
+                    f"effectif={horizon_effectif}) : reco score-exact ignorée. "
+                    f"Augmenter horizon_nuit pour le couvrir.",
+                    stacklevel=2,
+                )
+                continue
+            reco_m, wr_m, df_m = _eval_exact_market(
+                markets_by_idx[idx], g1_idx, g2_idx, has_booster,
+                gains_1N2[idx], base_crowds[idx], p_empirique_1D[idx],
+                base_alphas[idx], V_nexts_avg_fine[k], noms_choix
+            )
+            night_markets[idx + 1] = (reco_m, wr_m, df_m)
+        reco, best_wr, market_df = night_markets[match_id_cible]
+        return reco, best_wr, market_df, Q_table_jour, night_markets
+
+    # --- Mode SCORES EXACTS (match du jour seul) ---
     if exact_score_data is not None:
         return _recommend_exact_score(
             exact_score_data, g1_idx, g2_idx, has_booster,
@@ -261,22 +359,29 @@ def run_daily_pipeline(
     return reco, best_wr, ev_actions, Q_table_jour
 
 
-def _recommend_exact_score(exact_score_data, g1_idx, g2_idx, has_booster,
-                           gains_match, crowd_match, p_empirique_match, alpha_match,
-                           V_next, noms_choix, Q_table_jour, outcome_probas=None):
+def _eval_exact_market(market, g1_idx, g2_idx, has_booster,
+                       gains_match, crowd_match, p_empirique_match, alpha_match,
+                       V_next, noms_choix):
     """
-    Décision du match du jour sur les SCORES EXACTS. Construit le marché (ancré
-    sur le 1N2 du CSV via outcome_probas), évalue le WR de chaque score via
-    evaluate_exact_score_day, et renvoie (reco, best_wr, market_df, Q_table_jour).
+    Évalue un ExactScoreMarket déjà construit à l'état (g1_idx, g2_idx), chaîné sur
+    V_next (post-match). Renvoie (reco, best_wr, market_df). Brique partagée par les
+    modes mono-match et multi-matchs.
     """
-    market = build_exact_score_market(exact_score_data, outcome_probas=outcome_probas)
+    gm = gains_match.astype(np.float64)
+    cm = crowd_match.astype(np.float64)
+    pm = p_empirique_match.astype(np.float64)
+    a = float(alpha_match)
 
     Q_exact = evaluate_exact_score_day(
-        g1_idx, g2_idx,
-        market.outcomes, market.p_score, market.cond_crowd, market.bonus,
-        gains_match.astype(np.float64), crowd_match.astype(np.float64),
-        p_empirique_match.astype(np.float64), float(alpha_match), V_next
+        g1_idx, g2_idx, market.outcomes, market.p_score, market.cond_crowd, market.bonus,
+        gm, cm, pm, a, V_next
     )  # shape (K, 3) : [base, keep, use]
+    # WR "si l'agent loupe son score exact" : l'agent ne touche que le gain d'outcome
+    # (bonus agent neutralisé) ; Bob/peloton gardent leur bonus. Plancher robuste.
+    Q_no_bonus = evaluate_exact_score_day(
+        g1_idx, g2_idx, market.outcomes, market.p_score, market.cond_crowd, market.bonus,
+        gm, cm, pm, a, V_next, agent_bonus_factor=0.0
+    )
 
     # Choix de l'action (score) et du timing du booster — même logique qu'en 1N2.
     if has_booster:
@@ -293,16 +398,39 @@ def _recommend_exact_score(exact_score_data, g1_idx, g2_idx, has_booster,
         best_wr = float(Q_exact[best_idx, 0])
         reco = f"{market.scores[best_idx]}"
 
+    # WR plancher (sans le bonus de l'agent), dans le même régime de booster que la reco
+    if has_booster:
+        wr_outcome = np.maximum(Q_no_bonus[:, 1], Q_no_bonus[:, 2])
+    else:
+        wr_outcome = Q_no_bonus[:, 0]
+
     market_df = pd.DataFrame({
         "Score": market.scores,
         "Outcome": [noms_choix[o] for o in market.outcomes],
         "True Proba (%)": market.p_score * 100.0,
         "Crowd cond. (%)": market.cond_crowd * 100.0,
         "Bonus": market.bonus,
+        "E[pts MPP]": expected_mpp_points(market, gains_match),
         "E[pts 1/2/3]": expected_simple_points(market),
         "WR base (%)": Q_exact[:, 0] * 100.0,
         "WR keep (%)": Q_exact[:, 1] * 100.0,
         "WR x2 (%)": Q_exact[:, 2] * 100.0,
+        "WR outcome (%)": wr_outcome * 100.0,
     })
 
+    return reco, best_wr, market_df
+
+
+def _recommend_exact_score(exact_score_data, g1_idx, g2_idx, has_booster,
+                           gains_match, crowd_match, p_empirique_match, alpha_match,
+                           V_next, noms_choix, Q_table_jour, outcome_probas=None):
+    """
+    Mode mono-match : construit le marché (ancré sur le 1N2 via outcome_probas) et
+    renvoie (reco, best_wr, market_df, Q_table_jour).
+    """
+    market = build_exact_score_market(exact_score_data, outcome_probas=outcome_probas)
+    reco, best_wr, market_df = _eval_exact_market(
+        market, g1_idx, g2_idx, has_booster,
+        gains_match, crowd_match, p_empirique_match, alpha_match, V_next, noms_choix
+    )
     return reco, best_wr, market_df, Q_table_jour
