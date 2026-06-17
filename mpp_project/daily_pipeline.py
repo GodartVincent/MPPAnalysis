@@ -321,7 +321,7 @@ def run_daily_pipeline(
                     stacklevel=2,
                 )
                 continue
-            reco_m, wr_m, df_m = _eval_exact_market(
+            reco_m, wr_m, df_m = eval_exact_market(
                 markets_by_idx[idx], g1_idx, g2_idx, has_booster,
                 gains_1N2[idx], base_crowds[idx], p_empirique_1D[idx],
                 base_alphas[idx], V_nexts_avg_fine[k], noms_choix
@@ -359,13 +359,14 @@ def run_daily_pipeline(
     return reco, best_wr, ev_actions, Q_table_jour
 
 
-def _eval_exact_market(market, g1_idx, g2_idx, has_booster,
-                       gains_match, crowd_match, p_empirique_match, alpha_match,
-                       V_next, noms_choix):
+def eval_exact_market(market, g1_idx, g2_idx, has_booster,
+                      gains_match, crowd_match, p_empirique_match, alpha_match,
+                      V_next, noms_choix):
     """
     Évalue un ExactScoreMarket déjà construit à l'état (g1_idx, g2_idx), chaîné sur
-    V_next (post-match). Renvoie (reco, best_wr, market_df). Brique partagée par les
-    modes mono-match et multi-matchs.
+    V_next (post-match, fine 1001x1001x2). Renvoie (reco, best_wr, market_df).
+    Brique partagée : modes mono/multi-matchs du NB10 ET phases finales (NB18), où
+    V_next est l'horizon endgame tranché par l'état des favoris.
     """
     gm = gains_match.astype(np.float64)
     cm = crowd_match.astype(np.float64)
@@ -429,7 +430,7 @@ def _recommend_exact_score(exact_score_data, g1_idx, g2_idx, has_booster,
     renvoie (reco, best_wr, market_df, Q_table_jour).
     """
     market = build_exact_score_market(exact_score_data, outcome_probas=outcome_probas)
-    reco, best_wr, market_df = _eval_exact_market(
+    reco, best_wr, market_df = eval_exact_market(
         market, g1_idx, g2_idx, has_booster,
         gains_match, crowd_match, p_empirique_match, alpha_match, V_next, noms_choix
     )

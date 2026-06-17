@@ -10,6 +10,7 @@ import shin
 import unicodedata
 from collections import namedtuple
 from scipy.stats import binom
+from scipy.optimize import root_scalar
 from typing import Tuple
 
 # --- CONSTANTES DU MODÈLE MPP (À mettre à jour avec les résultats du Notebook 12_) ---
@@ -114,6 +115,31 @@ def calculate_true_outcome_probas_from_odds(odds: np.ndarray) -> np.ndarray:
     if odds_array.ndim == 2:
         return np.vstack([_shin_row(row) for row in odds_array])
     return _shin_row(odds_array)
+
+
+def calibrate_qualification_probs(raw_probs, target_sum=32.0):
+    """
+    Dé-vig d'un marché MULTI-VAINQUEURS (qualification) : ajuste les probabilités
+    implicites brutes `raw_probs` (= 1/cote_qualif) par un SHIFT GLOBAL en log-odds
+    (logit) pour que leur somme atteigne `target_sum` (= nombre d'équipes qualifiées),
+    sans qu'aucune ne sorte de ]0, 1[ et en préservant l'ordre des équipes.
+
+    Pourquoi pas Shin : Shin force la somme à 1 (marché à VAINQUEUR UNIQUE). La
+    qualification est multi-vainqueurs (~32 équipes sur 48 en CDM 2026), donc on retire
+    la marge bookmaker de façon homogène en log-odds plutôt que de normaliser à 1.
+
+    Étapes : p -> logit z=ln(p/(1-p)) -> on cherche c tel que Σ sigmoïde(z+c) = target_sum.
+    Retourne un array (N,) de probabilités vraies sommant à `target_sum`.
+    """
+    raw = np.clip(np.asarray(raw_probs, dtype=float), 1e-5, 1.0 - 1e-5)
+    logits = np.log(raw / (1.0 - raw))
+
+    def objective(c):
+        return np.sum(1.0 / (1.0 + np.exp(-(logits + c)))) - target_sum
+
+    res = root_scalar(objective, bracket=[-10.0, 10.0])
+    c = res.root
+    return 1.0 / (1.0 + np.exp(-(logits + c)))
 
 def get_observation(
     match_probas: np.ndarray,      # (3,) Raw probabilities

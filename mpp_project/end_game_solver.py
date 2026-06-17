@@ -15,57 +15,78 @@ GAP_MAX = GRID_SIZE - 1 - GAP_OFFSET
 @njit
 def build_terminal_state(
     points_victoire_my, points_victoire_bob, points_victoire_pack,
-    scorers_probs, scorers_gains_my, scorers_gains_bob, scorers_gains_pack
+    scorer_gain_my, scorer_gain_bob, scorer_gain_pack, joint_scorer
 ):
     """
-    Construit la matrice V finale des matchs de phases finales.
-    Applique les points des vainqueurs et des meilleurs buteurs.
+    Construit la matrice V terminale des phases finales (après la finale, t=32).
+
+    Demi-points : la grille (501, offset 300) et solve_endgame_dp travaillent en
+    DEMI-POINTS (gains /2). On divise donc TOUS les points (victoire + buteur) par 2
+    pour rester dans le même espace (corrige un ancien décalage ×2).
+
+    Bonus FAVORI (axes my_fav/bob_fav/pack_fav) : fav == 1 signifie que l'équipe-favori
+    du joueur a gagné la finale -> il touche `points_victoire_*`. Ces axes sont pilotés
+    DYNAMIQUEMENT par la DP (corrélés aux issues 1N2).
+
+    Bonus BUTEUR (loi jointe `joint_scorer`, 8 cases) : distribution CONJOINTE des
+    indicateurs (mon buteur top ?, buteur de Bob top ?, buteur du peloton top ?),
+    estimée par Poisson Monte-Carlo pour l'arbre courant (cf.
+    scorer_model.top_scorer_joint_probs). `joint_scorer[combo]` avec
+    combo = my_top*4 + bob_top*2 + pack_top ; somme = 1. Les égalités (plusieurs picks
+    meilleurs buteurs simultanément) sont nativement portées par la loi jointe.
+    `scorer_gain_*` = gain MPP (PLEIN) du buteur parié par chaque joueur.
     """
     V_term = np.zeros((GRID_SIZE, GRID_SIZE, 2, 2, 2, 2), dtype=np.float32)
-    n_scorers = len(scorers_probs)
-    
+
+    sg_my_h = scorer_gain_my / 2.0
+    sg_bob_h = scorer_gain_bob / 2.0
+    sg_pack_h = scorer_gain_pack / 2.0
+
     for g1 in range(GRID_SIZE):
         val_g1 = g1 - GAP_OFFSET
         for g2 in range(GRID_SIZE):
             val_g2 = g2 - GAP_OFFSET
-            
+
             for b in range(2):
                 for my_fav in range(2):
                     for bob_fav in range(2):
                         for pack_fav in range(2):
-                            
-                            # 1. Ajout des points exacts si les favoris respectifs gagnent la compétition
-                            # (À t=32, si fav == 1, cela veut dire qu'ils ont gagné la finale)
-                            bonus_my = points_victoire_my if my_fav == 1 else 0
-                            bonus_bob = points_victoire_bob if bob_fav == 1 else 0
-                            bonus_pack = points_victoire_pack if pack_fav == 1 else 0
-                            
+
+                            # 1. Bonus de victoire finale (demi-points)
+                            bonus_my = (points_victoire_my / 2.0) if my_fav == 1 else 0.0
+                            bonus_bob = (points_victoire_bob / 2.0) if bob_fav == 1 else 0.0
+                            bonus_pack = (points_victoire_pack / 2.0) if pack_fav == 1 else 0.0
+
                             base_gap1 = val_g1 + bonus_my - bonus_bob
                             base_gap2 = val_g2 + bonus_my - bonus_pack
-                            
+
                             expected_wr = 0.0
-                            
-                            # 2. CONVOLUTION DE LA VARIANCE DU MEILLEUR BUTEUR
-                            for s in range(n_scorers):
-                                p_s = scorers_probs[s]
-                                if p_s == 0.0: continue
-                                
-                                # Calcul des gaps finaux pour ce scénario de buteur spécifique
-                                final_gap1 = base_gap1 + scorers_gains_my[s] - scorers_gains_bob[s]
-                                final_gap2 = base_gap2 + scorers_gains_my[s] - scorers_gains_pack[s]
-                                
-                                # Conditions de victoire pour CE scénario
+
+                            # 2. CONVOLUTION DE LA LOI JOINTE DU MEILLEUR BUTEUR
+                            for combo in range(8):
+                                p_c = joint_scorer[combo]
+                                if p_c == 0.0:
+                                    continue
+                                my_top = (combo >> 2) & 1
+                                bob_top = (combo >> 1) & 1
+                                pack_top = combo & 1
+
+                                add_my = sg_my_h if my_top == 1 else 0.0
+                                add_bob = sg_bob_h if bob_top == 1 else 0.0
+                                add_pack = sg_pack_h if pack_top == 1 else 0.0
+
+                                final_gap1 = base_gap1 + add_my - add_bob
+                                final_gap2 = base_gap2 + add_my - add_pack
+
                                 if final_gap1 > 0 and final_gap2 > 0:
-                                    expected_wr += p_s * 1.0
+                                    expected_wr += p_c * 1.0
                                 elif final_gap1 == 0 and final_gap2 > 0:
-                                    expected_wr += p_s * 0.5
+                                    expected_wr += p_c * 0.5
                                 elif final_gap1 == 0 and final_gap2 == 0:
-                                    expected_wr += p_s * 0.333
-                                    
-                            # On stocke l'espérance de Win Rate qui prend désormais en compte 
-                            # les "queues de distribution" (les gros coups de chance ou de malchance)
+                                    expected_wr += p_c * (1.0 / 3.0)
+
                             V_term[g1, g2, b, my_fav, bob_fav, pack_fav] = expected_wr
-                            
+
     return V_term
 
 # ==========================================
@@ -110,53 +131,6 @@ def get_expected_v_outcome(V_next, g1, g2, b, my_fav, bob_fav, pack_fav, my_role
         vB = V_next[g1, g2, b, next_my_B, next_bob_B, next_pack_B]
         
         return 0.5 * vA + 0.5 * vB
-
-# ==========================================
-# 1. INITIALISATION DE L'ÉTAT TERMINAL
-# ==========================================
-@njit
-def build_terminal_state_with_variance(
-    points_victoire_my, points_victoire_bob, points_victoire_pack,
-    scorers_probs, scorers_gains_my, scorers_gains_bob, scorers_gains_pack
-):
-    V_term = np.zeros((GRID_SIZE, GRID_SIZE, 2, 2, 2, 2), dtype=np.float32)
-    n_scorers = len(scorers_probs)
-    
-    for g1 in range(GRID_SIZE):
-        val_g1 = g1 - GAP_OFFSET
-        for g2 in range(GRID_SIZE):
-            val_g2 = g2 - GAP_OFFSET
-            
-            for b in range(2):
-                for my_fav in range(2):
-                    for bob_fav in range(2):
-                        for pack_fav in range(2):
-                            
-                            # Division par 2.0 des points
-                            bonus_my = (points_victoire_my / 2.0) if my_fav == 1 else 0
-                            bonus_bob = (points_victoire_bob / 2.0) if bob_fav == 1 else 0
-                            bonus_pack = (points_victoire_pack / 2.0) if pack_fav == 1 else 0
-                            
-                            base_gap1 = val_g1 + bonus_my - bonus_bob
-                            base_gap2 = val_g2 + bonus_my - bonus_pack
-                            
-                            expected_wr = 0.0
-                            
-                            for s in range(n_scorers):
-                                p_s = scorers_probs[s]
-                                if p_s == 0.0: continue
-                                
-                                # Division par 2.0 des buteurs
-                                final_gap1 = base_gap1 + (scorers_gains_my[s] / 2.0) - (scorers_gains_bob[s] / 2.0)
-                                final_gap2 = base_gap2 + (scorers_gains_my[s] / 2.0) - (scorers_gains_pack[s] / 2.0)
-                                
-                                if final_gap1 > 0 and final_gap2 > 0: expected_wr += p_s * 1.0
-                                elif final_gap1 == 0 and final_gap2 > 0: expected_wr += p_s * 0.5
-                                elif final_gap1 == 0 and final_gap2 == 0: expected_wr += p_s * 0.333
-                                    
-                            V_term[g1, g2, b, my_fav, bob_fav, pack_fav] = expected_wr
-                            
-    return V_term
 
 # ==========================================
 # 2. LE MOTEUR DP OPTIMISÉ (VECTORISATION + GRILLE 501)

@@ -15,7 +15,9 @@ from mpp_project.bracket_simulator import (
     poules_horizon_from_full,
     conditional_matchup_prob,
     simulate_champion_distribution,
+    devig_group_odds,
 )
+from mpp_project.core import calibrate_qualification_probs
 from tests.helpers import DATA_DIR
 
 ODDS_PATH = DATA_DIR / "CDM_2026_group_stage_odds.csv"
@@ -147,6 +149,27 @@ def test_poules_horizon_6d_ajoute_axe_match():
     out = poules_horizon_from_full(full)
     assert out.shape == (1, 6, 6, 2)
     assert np.allclose(out[0], 0.7)
+
+
+# ---------------------------------------------------------------------------
+# Dé-vig des cotes (victoire = Shin somme 1 ; qualif = logit-shift somme N_QUALIFIED)
+# ---------------------------------------------------------------------------
+def test_calibrate_qualification_probs():
+    """Logit-shift : la somme atteint la cible, probas dans ]0,1[, ordre préservé."""
+    raw = np.array([0.9, 0.55, 0.2, 0.05, 0.62, 0.48])
+    out = calibrate_qualification_probs(raw, target_sum=3.0)
+    assert out.sum() == pytest.approx(3.0, abs=1e-6)
+    assert np.all((out > 0.0) & (out < 1.0))
+    assert np.all(np.argsort(raw) == np.argsort(out)), "ordre des équipes non préservé"
+
+
+def test_devig_group_odds(df_odds):
+    """Victoire dé-viggée par Shin (somme 1), qualif par logit-shift (somme 32)."""
+    cv, q = devig_group_odds(df_odds)
+    assert cv.shape == (48,) and q.shape == (48,)
+    assert cv.sum() == pytest.approx(1.0, abs=1e-6)
+    assert q.sum() == pytest.approx(32.0, abs=1e-6)
+    assert np.all((cv > 0.0) & (cv < 1.0)) and np.all((q > 0.0) & (q < 1.0))
 
 
 # ---------------------------------------------------------------------------
