@@ -31,6 +31,15 @@ MAX_MPP_GAIN = 225.0  # Gain MPP maximum réaliste (allemagne - curacao : 222.0)
 MIN_TRUE_PROBA = 0.02  # Probabilité minimale réaliste d'une issue (allemagne - curacao : 0.02)
 MAX_TRUE_PROBA = 0.95  # Probabilité maximale réaliste d'une issue (allemagne - curacao : 0.95)
 
+# --- CORRECTION DE FORME DU CROWD SCORE EXACT (calibré au Notebook 25_, §4) ---
+# Le crowd Winamax conditionnel (normalisé par outcome) approxime mal le crowd MPP :
+# il SUR-pondère le score 0-0 (les parieurs casual MPP le boudent au profit de 1-1, 2-1…).
+# Modèle : cc_mpp(s) ∝ cc_wmx(s)^gamma · exp(delta · 1[s == 0-0]), renormalisé PAR OUTCOME.
+# gamma≈1 (Winamax bien calibré en ÉCHELLE -> une simple température n'aide pas), seul le
+# 0-0 est biaisé. LOO par match : ~61 % -> ~75 % d'exactitude de catégorie de bonus.
+EXACT_SCORE_SHAPE_GAMMA = 1.0          # température sur le crowd (1.0 = échelle inchangée)
+EXACT_SCORE_ZERO_ZERO_LOG_PENALTY = -1.645  # log-pénalité du 0-0 (exp(-1.645) ≈ 19 %)
+
 def calculate_win_probability(min_successes: int, num_matches: int, success_prob: float) -> float:
     """
     Calculates the probability of achieving at least 'min_successes' 
@@ -773,8 +782,48 @@ ExactScoreMarket = namedtuple(
 )
 
 
+def correct_cond_crowd(cond_crowd, scores, outcomes,
+                       gamma=EXACT_SCORE_SHAPE_GAMMA,
+                       delta00=EXACT_SCORE_ZERO_ZERO_LOG_PENALTY):
+    """
+    Corrige le crowd conditionnel Winamax (déjà normalisé PAR OUTCOME) vers une
+    estimation du crowd conditionnel MPP, via le modèle calibré au Notebook 25_ (§4) :
+
+        cc_mpp(s) ∝ cc_wmx(s)**gamma · exp(delta00 · 1[s == "0-0"])
+
+    renormalisé PAR OUTCOME. Les scores à crowd nul (cc_wmx == 0) restent nuls :
+    le 0-0 d'un blowout que MPP joue mais pas Winamax (ex. 1-1) est inatteignable
+    depuis le seul crowd Winamax (limite connue, cf. NB25).
+
+    Avec `gamma == 1` (défaut), la correction est un NO-OP pour tout outcome ne
+    contenant pas de 0-0 (et pour un 0-0 seul dans son outcome) : seul un outcome
+    nul listant le 0-0 ET au moins un autre nul (1-1, 2-2…) est modifié — le 0-0
+    y est dévalué (exp(delta00) < 1) et la masse redistribuée aux autres nuls.
+
+    Renvoie un nouveau tableau (K,) de crowd conditionnel corrigé.
+    """
+    cc = np.asarray(cond_crowd, dtype=float)
+    outc = np.asarray(outcomes)
+    is00 = np.array([
+        1.0 if str(s).strip() in ("0-0", "0 - 0") else 0.0 for s in scores
+    ], dtype=float)
+
+    out = cc.copy()
+    for o in np.unique(outc):
+        mask = outc == o
+        # Rien à corriger si l'outcome ne liste pas de 0-0 et gamma==1 (no-op exact).
+        if gamma == 1.0 and not is00[mask].any():
+            continue
+        w = np.where(cc[mask] > 0.0, cc[mask] ** gamma * np.exp(delta00 * is00[mask]), 0.0)
+        tot = w.sum()
+        if tot > 0.0:
+            out[mask] = w / tot
+        # tot == 0 (aucun crowd non nul dans l'outcome) -> on garde l'original.
+    return out
+
+
 def build_exact_score_market(exact_score_data, outcome_probas=None,
-                             outcome_tol=0.08) -> ExactScoreMarket:
+                             outcome_tol=0.08, shape_correction=True) -> ExactScoreMarket:
     """
     Construit le marché des scores exacts à partir d'un dict
     `{ "b1-b2": (cote, crowd_pct), ... }`. Les slots à cote absente
@@ -801,6 +850,12 @@ def build_exact_score_market(exact_score_data, outcome_probas=None,
       Si `outcome_probas` est None (rétro-compat / tests), on RENORMALISE simplement
       le vecteur global à 1 (outright partiel : masse des scores non listés repliée
       sur les listés).
+
+    CORRECTION DE FORME (`shape_correction`, défaut True) : le crowd conditionnel
+    Winamax est corrigé du biais 0-0 via `correct_cond_crowd` (modèle calibré NB25 §4)
+    AVANT le calcul du bonus. Le `cond_crowd` renvoyé est donc déjà corrigé (et alimente
+    aussi la proba de bonus de Bob/peloton dans la DP). Mettre False pour récupérer le
+    crowd Winamax brut (cc_wmx) sans correction.
     """
     scores, odds, crowds, outcomes = [], [], [], []
     for score, data in exact_score_data.items():
@@ -864,6 +919,12 @@ def build_exact_score_market(exact_score_data, outcome_probas=None,
         tot = float(crowds[mask].sum())
         if tot > 0.0:
             cond_crowd[mask] = crowds[mask] / tot
+
+    # Correction de FORME (NB25 §4) : le crowd Winamax sur-pondère le 0-0 vs MPP.
+    # Appliquée AVANT le barème -> le cc corrigé pilote le bonus ET sert ensuite de
+    # proba de bonus de Bob/peloton dans la DP (evaluate_exact_score_day).
+    if shape_correction:
+        cond_crowd = correct_cond_crowd(cond_crowd, scores, outcomes)
 
     bonus = np.asarray([exact_score_bonus(cc) for cc in cond_crowd], dtype=np.int64)
 

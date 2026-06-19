@@ -18,10 +18,12 @@ import pytest
 from mpp_project.core import (
     ExactScoreMarket,
     build_exact_score_market,
+    correct_cond_crowd,
     exact_score_bonus,
     expected_mpp_points,
     expected_simple_points,
     load_exact_scores,
+    EXACT_SCORE_ZERO_ZERO_LOG_PENALTY,
 )
 from mpp_project.core import load_exact_scores_by_match
 from mpp_project.oracle_dp import (
@@ -69,6 +71,56 @@ def test_build_market():
 
     # Bonus cohérents avec le barème
     assert list(m.bonus) == [20, 30, 20, 20]
+
+
+def test_shape_correction_devalue_0_0():
+    """Correction de forme (NB25 §4) : dans un outcome nul listant 0-0 ET un autre nul,
+    le 0-0 est dévalué (exp(delta) < 1) et la masse redistribuée ; les outcomes sans 0-0
+    sont inchangés (gamma=1). Effet répercuté sur le bonus."""
+    data = {
+        "1-0": (3.0, 30.0), "2-0": (6.0, 10.0),   # outcome 0 (pas de 0-0)
+        "0-0": (8.0, 20.0), "1-1": (6.0, 20.0),   # outcome 1 : 0-0 + 1-1, crowd brut 50/50
+        "0-1": (7.0, 12.0),                         # outcome 2 (seul)
+    }
+    raw = build_exact_score_market(data, shape_correction=False)
+    cor = build_exact_score_market(data, shape_correction=True)
+
+    i00 = raw.scores.index("0-0")
+    i11 = raw.scores.index("1-1")
+    # crowd brut : 0-0 et 1-1 à égalité (0.5 chacun)
+    assert raw.cond_crowd[i00] == pytest.approx(0.5)
+    # après correction : 0-0 dévalué, 1-1 gonflé, somme du nul conservée à 1
+    assert cor.cond_crowd[i00] < raw.cond_crowd[i00]
+    assert cor.cond_crowd[i11] > raw.cond_crowd[i11]
+    assert cor.cond_crowd[i00] + cor.cond_crowd[i11] == pytest.approx(1.0)
+    # ratio = exp(delta) (la renormalisation préserve le rapport des poids)
+    assert cor.cond_crowd[i00] / cor.cond_crowd[i11] == pytest.approx(
+        np.exp(EXACT_SCORE_ZERO_ZERO_LOG_PENALTY))
+    # outcomes sans 0-0 : strictement inchangés (gamma=1)
+    for s in ("1-0", "2-0", "0-1"):
+        j = raw.scores.index(s)
+        assert cor.cond_crowd[j] == pytest.approx(raw.cond_crowd[j])
+    # 0-0 moins joué => bonus >= bonus brut (barème décroissant en cc)
+    assert cor.bonus[i00] >= raw.bonus[i00]
+
+
+def test_shape_correction_0_0_seul_no_op():
+    """Un 0-0 seul dans son outcome nul -> renormalisation à 1.0 -> no-op (bonus inchangé)."""
+    data = {"1-0": (3.0, 30.0), "0-0": (8.0, 15.0), "0-1": (7.0, 12.0)}
+    raw = build_exact_score_market(data, shape_correction=False)
+    cor = build_exact_score_market(data, shape_correction=True)
+    assert np.allclose(cor.cond_crowd, raw.cond_crowd)
+    assert list(cor.bonus) == list(raw.bonus)
+
+
+def test_correct_cond_crowd_garde_zeros():
+    """Un score à crowd conditionnel nul reste nul (inatteignable depuis cc_wmx)."""
+    scores = ["0-0", "1-1", "2-2"]
+    outcomes = np.array([1, 1, 1])
+    cc = np.array([0.7, 0.3, 0.0])          # 2-2 jamais joué côté Winamax
+    out = correct_cond_crowd(cc, scores, outcomes)
+    assert out[2] == 0.0
+    assert out.sum() == pytest.approx(1.0)
 
 
 def test_build_market_creux_renormalise():

@@ -169,7 +169,7 @@ def run_daily_pipeline(
             idx = int(mid) - 1
             if idx < match_idx or idx >= n_matches:
                 continue  # match déjà joué ou hors tournoi
-            mkt = build_exact_score_market(data, outcome_probas=base_true_probas[idx])
+            mkt = build_exact_score_market(data, outcome_probas=base_true_probas[idx], shape_correction=True)
             markets_by_idx[idx] = mkt
             Kmax = max(Kmax, len(mkt.scores))
         if match_idx not in markets_by_idx:
@@ -456,7 +456,7 @@ def _recommend_exact_score(exact_score_data, g1_idx, g2_idx, has_booster,
     Mode mono-match : construit le marché (ancré sur le 1N2 via outcome_probas) et
     renvoie (reco, best_wr, market_df, Q_table_jour).
     """
-    market = build_exact_score_market(exact_score_data, outcome_probas=outcome_probas)
+    market = build_exact_score_market(exact_score_data, outcome_probas=outcome_probas, shape_correction=True)
     reco, best_wr, market_df = eval_exact_market(
         market, g1_idx, g2_idx, has_booster,
         gains_match, crowd_match, p_empirique_match, alpha_match, V_next, noms_choix
