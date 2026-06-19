@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 from collections import OrderedDict
+from datetime import date
 from pathlib import Path
 
 from mpp_project.core import apply_heteroscedastic_noise, apply_temporal_drift, build_exact_score_market, calculate_true_outcome_probas_from_odds, estimate_crowd_3D, expected_mpp_points, expected_simple_points, normalize_crowds, validate_match_dataframe
@@ -25,7 +26,8 @@ def run_daily_pipeline(
     save_abaques: bool = True,
     validate_input: bool = True,
     exact_score_data=None,
-    exact_scores_by_match=None
+    exact_scores_by_match=None,
+    reference_date=None
 ):
     """
     Exécute la chaîne de décision (Drift + DP) et sauvegarde les abaques des prochains matchs.
@@ -43,6 +45,14 @@ def run_daily_pipeline(
       validate_input       : si True (défaut), contrôle la cohérence du CSV (phases,
                              gains, équipes, crowds) et émet des warnings. Mettre à
                              False pour les fixtures de test synthétiques.
+      reference_date       : date de référence du DRIFT PAR DATE (cf. apply_temporal_drift).
+                             None (défaut) -> date du jour (date.today()). Le drift des
+                             true_probas lointaines croît alors avec le nombre de jours
+                             entre cette date et la date de chaque match (colonne 'date'
+                             du CSV) selon un modèle de diffusion. Si le CSV n'a pas de
+                             colonne 'date' (fixtures de test), retombe sur le drift par
+                             phase historique. À fixer pour préparer l'analyse la veille
+                             ou pour des tests déterministes.
       exact_score_data     : dict { "b1-b2": (cote, crowd_pct) } optionnel. Si fourni,
                              la décision du MATCH DU JOUR porte sur les SCORES EXACTS
                              (et non 1N2) : l'agent, Bob et le peloton peuvent décrocher
@@ -74,6 +84,9 @@ def run_daily_pipeline(
     if validate_input:
         validate_match_dataframe(df)
     match_phases = df['phase'].tolist()
+    # Dates des matchs (pour le drift par date). Absentes des fixtures de test
+    # synthétiques -> None -> apply_temporal_drift retombe sur le drift par phase.
+    match_dates = pd.to_datetime(df['date']).to_numpy() if 'date' in df.columns else None
     n_matches = len(df)
 
     odds = df[['cote_1', 'cote_N', 'cote_2']].values.astype(np.float64)
@@ -113,9 +126,21 @@ def run_daily_pipeline(
     # ==========================================
     # Grille coarse (501×501, 2 pts/step) : même range [-600,+400], 4× plus rapide.
     # -----------------------------------------------------------------------
-    dists = np.arange(n_matches) - match_idx
-    dists_positive = np.maximum(0, dists)
-    alphas_bayes = 0.95 * (0.5 ** (dists_positive / 5.0))
+    # Poids du blend bayésien des crowds (confiance CSV vs crowd théorique) : 0.95 au
+    # présent, décroissant avec l'éloignement TEMPOREL du match (demi-vie 4 jours via
+    # la date du CSV vs reference_date). Rétro-compat : sans colonne 'date' (fixtures),
+    # on retombe sur la distance en NOMBRE DE MATCHS (demi-vie 5 indices).
+    if match_dates is not None:
+        ref_d = pd.Timestamp(reference_date if reference_date is not None else date.today()).normalize()
+        days_ahead = np.array([
+            0 if pd.isna(d) else max(0, (pd.Timestamp(d).normalize() - ref_d).days)
+            for d in match_dates
+        ], dtype=np.float64)
+        alphas_bayes = 0.95 * (0.5 ** (days_ahead / 4.0))
+    else:
+        dists = np.arange(n_matches) - match_idx
+        dists_positive = np.maximum(0, dists)
+        alphas_bayes = 0.95 * (0.5 ** (dists_positive / 5.0))
     alphas_2d = alphas_bayes.astype(np.float32)[:, np.newaxis]
 
     c1, cN, c2 = estimate_crowd_3D(base_true_probas[:, 0], base_true_probas[:, 1], base_true_probas[:, 2], add_noise=False)
@@ -185,7 +210,8 @@ def run_daily_pipeline(
     if use_split:
         V_far_sum = np.zeros((501, 501, 2), dtype=np.float32)
         for s in range(n_runs):
-            v_true_probas = apply_temporal_drift(base_true_probas, match_phases, current_match_idx=match_idx)
+            v_true_probas = apply_temporal_drift(base_true_probas, match_phases, current_match_idx=match_idx,
+                                                 match_dates=match_dates, reference_date=reference_date)
             v_crowds = apply_heteroscedastic_noise(blended_mean_crowds, rmse=dynamic_rmse)
             v_alphas = compute_alphas_isolement(v_true_probas, v_crowds, gains_1N2, seuil_isolement=seuil_isolement)
             V_far_s, _ = solve_dp_coarse(
@@ -241,7 +267,8 @@ def run_daily_pipeline(
         V_nexts_sum = np.zeros((horizon_effectif, 501, 501, 2), dtype=np.float32)
         for s in range(n_runs):
             if use_drift:
-                v_true_probas = apply_temporal_drift(base_true_probas, match_phases, current_match_idx=match_idx)
+                v_true_probas = apply_temporal_drift(base_true_probas, match_phases, current_match_idx=match_idx,
+                                                     match_dates=match_dates, reference_date=reference_date)
                 v_crowds = apply_heteroscedastic_noise(blended_mean_crowds, rmse=dynamic_rmse)
             else:
                 v_true_probas = base_true_probas.copy()

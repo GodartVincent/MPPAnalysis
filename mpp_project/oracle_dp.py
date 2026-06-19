@@ -13,11 +13,11 @@ N_ACTIONS = 3
 
 # --- Effectifs de la ligue (source UNIQUE : tout le code importe ces constantes
 #     depuis oracle_dp plutôt que d'écrire des nombres en dur). ---
-N_PLAYERS = 9                   # Taille de la ligue MPP.
+N_PLAYERS = 7                   # Taille de la ligue MPP.
 COEFF_ROBUSTESSE = 1.25         # Gonflement du peloton simulé pour absorber la variance
                                 # des bonus (favori/buteur ~ x2). cf. NB15/16.
-N_PELOTON = N_PLAYERS - 1                                 # 8 : peloton réel (on retire le leader/Bob).
-N_PELOTON_ROBUSTE = round(N_PELOTON * COEFF_ROBUSTESSE)   # 10 : peloton gonflé pour le Monte-Carlo.
+N_PELOTON = N_PLAYERS - 1                                 # 5 : peloton réel (on retire le leader/Bob).
+N_PELOTON_ROBUSTE = round(N_PELOTON * COEFF_ROBUSTESSE)   # 6 : peloton gonflé pour le Monte-Carlo.
 
 @njit
 def compute_alphas_isolement(true_probas, crowds, gains_1N2, seuil_isolement=80.0):

@@ -320,10 +320,52 @@ def simulate_true_proba_from_gain(gain_mpp, rmse=RMSE_GAINS, a=CUBIC_A, b=CUBIC_
 
     return proba_est
 
-def apply_temporal_drift(true_probas: np.ndarray, match_phases, current_match_idx: int = 0) -> np.ndarray:
+def apply_temporal_drift(true_probas: np.ndarray, match_phases, current_match_idx: int = 0,
+                         match_dates=None, reference_date=None,
+                         sigma_diff_ref: float = 0.025, days_diff_ref: float = 7.0,
+                         sigma_phase_same: float = 0.0, sigma_phase_1: float = 0.0325,
+                         sigma_phase_2: float = 0.055) -> np.ndarray:
     """
-    Simule la variation des probabilités réelles au fil du temps via un modèle de 'Drift Relatif'.
+    Simule la variation des probabilités réelles au fil du temps via un modèle de 'Drift'.
     Gère à la fois une matrice de matchs (N, 3) et un match unique vectorisé (3,).
+
+    Le drift a DEUX composantes INDÉPENDANTES (variances additives) :
+
+      1. DIFFUSION (gain d'info calendaire) : blessures à l'entraînement, fuites sur
+         le moral / le vestiaire, etc. Amplitude FAIBLE mais croissant avec le temps,
+         modèle de marche aléatoire :
+             sigma_diff(d) = sigma_diff_ref * sqrt(d / days_diff_ref)
+         où d = (date_match - reference_date) en jours (clampé >= 0). Calibré à
+         sigma_diff_ref ≈ 0.025 sur la fenêtre ouverture->fermeture d'un match de
+         Premier League (durée days_diff_ref).
+
+      2. PHASE / « l'équipe joue » (saut d'info discret) : quand l'équipe dispute des
+         matchs intermédiaires, BEAUCOUP d'info sort d'un coup (l'équipe ne joue pas
+         comme prévu, suspensions, scénarios de qualification...). Amplitude PLUS FORTE,
+         pilotée par le nombre de « shocks » de phase entre le match courant et le
+         match cible (J1->J2->J3->finales) :
+             même phase (0 shock) -> sigma_phase_same (def 0.0)
+             +1 phase            -> sigma_phase_1    (def 0.0325)
+             +2 phases ou plus   -> sigma_phase_2    (def 0.055)
+         `sigma_phase_same = 0` car « même phase » = 0 match intermédiaire joué : il n'y
+         a aucun saut d'info « l'équipe joue ». Le seul drift d'un match de même phase
+         vient du TEMPS qui passe, déjà capté par la composante DIFFUSION (ne pas
+         remettre un plancher ici sous peine de DOUBLE COMPTAGE avec sigma_diff).
+
+    Combinaison (cas matriciel, si `match_dates` fourni) :
+        std(match) = sqrt( sigma_diff(d)**2 + sigma_phase(shocks)**2 )
+
+    `reference_date` : date de référence comparée aux `match_dates`. None -> date du
+    jour (date.today()). Accepte date/datetime/str/Timestamp. À injecter dans les tests
+    pour un résultat déterministe. `match_dates` : itérable (N,) de dates ; NaT ->
+    composante diffusion nulle (seule la phase joue).
+
+    RÉTRO-COMPAT : si `match_dates` est None (chemin 1D de bracket_simulator sans dates,
+    NB15, fixtures de test sans colonne 'date'), seule la composante PHASE s'applique
+    (modèle historique). ATTENTION : sans dates il n'y a PAS de diffusion, donc les
+    matchs de MÊME PHASE ne sont plus driftés du tout (sigma_phase_same=0). Pour
+    retrouver un drift calendaire sur ces chemins (ex. NB15), passer `match_dates`.
+    Le cas 1D (true_probas de forme (3,)) reste inchangé (logique propre 0.025/0.035).
     """
     # Fonction utilitaire
     def get_phase_level(p_str):
@@ -358,45 +400,57 @@ def apply_temporal_drift(true_probas: np.ndarray, match_phases, current_match_id
     # ========================================================
     n_matches = len(true_probas)
     drifted_probas = np.copy(true_probas)
-    
-    # Récupération sécurisée (évite les IndexError)
+
+    use_dates = match_dates is not None
+
+    # Niveau de phase du match courant (composante "l'équipe joue", présente dans les
+    # DEUX régimes : seule en rétro-compat, additionnée à la diffusion sinon).
     if isinstance(match_phases, list) and current_match_idx < len(match_phases):
         current_phase_str = match_phases[current_match_idx]
     else:
         current_phase_str = "Phase Finale"
-        
     current_level = get_phase_level(current_phase_str)
-    
+
+    def _sigma_phase(target_level):
+        """Composante PHASE : amplitude du saut d'info quand l'équipe dispute des matchs."""
+        shocks = target_level - current_level
+        if target_level == 4 or shocks <= 0:
+            return sigma_phase_same
+        if shocks == 1:
+            return sigma_phase_1
+        return sigma_phase_2
+
+    if use_dates:
+        from datetime import date as _date
+        ref = pd.Timestamp(reference_date if reference_date is not None else _date.today()).normalize()
+        # sigma_diff(d) = diff_rate * sqrt(d), avec diff_rate tel que sigma_diff(days_diff_ref) = sigma_diff_ref
+        diff_rate = sigma_diff_ref / np.sqrt(days_diff_ref)
+
     for i in range(n_matches):
-        phase = match_phases[i] if (isinstance(match_phases, list) and i < len(match_phases)) else "Phase Finale"
-        
         # Le passé ou le match du jour est connu avec certitude
         if i <= current_match_idx:
             continue
-            
-        target_level = get_phase_level(phase)
-        shocks_remaining = target_level - current_level
-        
-        # --- LOGIQUE DE DRIFT RELATIF ---
-        if target_level == 4:
-            std_dev = 0.025
-        elif shocks_remaining <= 0:
-            std_dev = 0.025 
-        elif shocks_remaining == 1:
-            std_dev = 0.035 
-        elif shocks_remaining >= 2:
-            std_dev = 0.06 
+
+        phase = match_phases[i] if (isinstance(match_phases, list) and i < len(match_phases)) else "Phase Finale"
+        sigma_phase = _sigma_phase(get_phase_level(phase))
+
+        if use_dates:
+            di = match_dates[i]
+            d = 0 if pd.isna(di) else max(0, (pd.Timestamp(di).normalize() - ref).days)
+            sigma_diff = diff_rate * np.sqrt(d)
+            # Deux sources de bruit INDÉPENDANTES -> les variances s'additionnent.
+            std_dev = np.sqrt(sigma_diff ** 2 + sigma_phase ** 2)
         else:
-            std_dev = 0.025 
-            
+            std_dev = sigma_phase
+
         noise = np.random.normal(1.0, std_dev, 3)
-        
+
         # Ici true_probas[i] est un tableau (3,) et noise est (3,), la multiplication est valide
         drifted_probas[i] = true_probas[i] * noise
-        
+
         drifted_probas[i] = np.clip(drifted_probas[i], MIN_TRUE_PROBA, MAX_TRUE_PROBA)
         drifted_probas[i] = drifted_probas[i] / np.sum(drifted_probas[i])
-        
+
     return drifted_probas
 
 def calculate_mpp_gains(
@@ -623,13 +677,29 @@ def estimate_crowd_3D(p1, pN, p2, beta=CROWD_BETA, eps=CROWD_EPSILON, add_noise=
     return c1, cN, c2
 
 # Utilisée pour le pronostic des favoris et meilleurs buteurs (notebook 16)
-def generate_drifted_ensemble_crowds(match_du_jour_idx, probas_poules, csv_crowds_poules, n_ensembles=10):
+def generate_drifted_ensemble_crowds(match_du_jour_idx, probas_poules, csv_crowds_poules,
+                                     n_ensembles=10, match_dates=None, reference_date=None):
+    """
+    Ensemble de répartitions de foule bruitées (drift) pour NB16. Le poids du blend
+    bayésien (confiance crowd CSV vs crowd théorique) décroît avec l'éloignement du
+    match, demi-vie 4 :
+      - PAR DATE (si `match_dates` fourni) : éloignement en JOURS depuis `reference_date`
+        (def = date de `match_du_jour_idx`), cohérent avec daily_pipeline / NB15 ;
+      - PAR INDICE (rétro-compat) : éloignement en nombre de matchs depuis match_du_jour_idx.
+    """
     n_poules = len(probas_poules)
-    
-    # 1. Calcul des distances et des Alphas (Demi-vie de 4 matchs)
-    dists = np.arange(n_poules) - match_du_jour_idx
-    dists_positive = np.maximum(0, dists)
-    alphas = 0.95 * (0.5 ** (dists_positive / 4.0))
+
+    # 1. Calcul des distances et des Alphas (Demi-vie de 4 : jours si dates, sinon matchs)
+    if match_dates is not None:
+        ref = pd.Timestamp(reference_date if reference_date is not None
+                           else match_dates[match_du_jour_idx]).normalize()
+        dist_units = np.array([
+            0.0 if pd.isna(d) else max(0, (pd.Timestamp(d).normalize() - ref).days)
+            for d in match_dates
+        ], dtype=np.float64)
+    else:
+        dist_units = np.maximum(0, np.arange(n_poules) - match_du_jour_idx).astype(np.float64)
+    alphas = 0.95 * (0.5 ** (dist_units / 4.0))
     alphas_2d = alphas.astype(np.float32)[:, np.newaxis]
     
     # 2. Crowd Théorique Pur

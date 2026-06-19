@@ -46,6 +46,14 @@ _SIG = 0.03
 N_GROUP_MATCHES = 3
 
 
+@njit
+def _seed_numba(s):
+    """Graine le RNG INTERNE de Numba. Indispensable : np.random.seed() appelé en
+    Python ne touche PAS l'état RNG des fonctions @njit (états séparés). Sans cela,
+    _calib_top_counts / les simulations njit sont non reproductibles d'un run à l'autre."""
+    np.random.seed(s)
+
+
 # ==========================================================================
 # 1. ÉCHANTILLONNAGE PONDÉRÉ SANS REMISE (Gumbel-top-k = Plackett-Luce)
 # ==========================================================================
@@ -174,24 +182,60 @@ def _simulate_matches_played_core(
     return out
 
 
-def simulate_team_matches_played(df_odds, n_runs=20000, beta=0.95, seed=None,
-                                 include_group_matches=True):
+def compute_group_matches_remaining(df_tournoi, team_names):
     """
-    Distribution Monte-Carlo du nombre TOTAL de matchs joués par équipe sur un
-    tournoi complet (poules + knockout), pour la calibration des alpha.
+    Nombre de matchs de POULE RESTANTS (résultat non renseigné) par équipe, aligné
+    sur l'ordre de `team_names` (= ordre des lignes de df_odds des groupes).
+
+    Lit `data/CDM_2026.csv` (colonnes team_A/team_B/phase/result) : compte, pour
+    chaque équipe, ses matchs de phase `Poule_*` sans résultat. Sert à la calibration
+    IN-PLAY (composante poule de M_restants ; les matchs déjà joués sont dans
+    `current_goals`). Pré-tournoi -> 3 par équipe. Noms comparés via normalize_team_name.
+    """
+    from mpp_project.core import normalize_team_name
+    t2i = {str(t).strip().lower(): i for i, t in enumerate(team_names)}
+    rem = np.zeros(len(team_names), dtype=np.int64)
+    cols = {"team_A", "team_B", "phase"}
+    if not cols <= set(df_tournoi.columns):
+        return rem
+    for _, r in df_tournoi.iterrows():
+        if not str(r["phase"]).lower().startswith("poule"):
+            continue
+        res = str(r.get("result", "")).strip().lower()
+        if res not in ("", "nan", "none"):
+            continue  # match déjà joué -> buts dans current_goals
+        for col in ("team_A", "team_B"):
+            nm = normalize_team_name(r[col])
+            if nm in t2i:
+                rem[t2i[nm]] += 1
+    return rem
+
+
+def simulate_team_matches_played(df_odds, n_runs=20000, beta=0.95, seed=None,
+                                 include_group_matches=True, group_matches_per_team=None):
+    """
+    Distribution Monte-Carlo du nombre de matchs joués par équipe (poules + knockout),
+    pour la calibration des alpha.
 
     Reproduit le modèle d'avancement de `bracket_simulator.simulate_champion_distribution`
     (Plackett-Luce sur cote_1er, équation des 3es sur la qualif VRAIE, force
     conditionnelle dé-viggée + bruit), en njit.
 
+    `group_matches_per_team` (n_teams,) optionnel : composante POULE par équipe
+    (alignée sur df_odds). Fournir les matchs de poule RESTANTS (cf.
+    compute_group_matches_remaining) pour une calibration IN-PLAY -> matchs FUTURS.
+    Si None : `N_GROUP_MATCHES` (=3) constant si include_group_matches, sinon 0
+    (régime pré-tournoi). NB : la composante knockout vient de la simulation (le
+    bracket est re-simulé depuis les cotes des groupes ; valable tant que le tableau
+    est ouvert — poules / début knockout sans éliminations connues).
+
     Retour : (matches (n_runs, n_teams) int, team_names (n_teams,)).
-      matches[r, i] = N_GROUP_MATCHES (=3 si include_group_matches) + nb de matchs
-      knockout joués par l'équipe i dans le tournoi r.
     """
     from mpp_project.bracket_simulator import devig_group_odds, N_QUALIFIED
 
     if seed is not None:
         np.random.seed(seed)
+        _seed_numba(seed)
 
     team_names = df_odds["team"].astype(str).str.strip().str.lower().values
     n_teams = len(team_names)
@@ -237,6 +281,9 @@ def simulate_team_matches_played(df_odds, n_runs=20000, beta=0.95, seed=None,
         group_team_ids, group_logw, group_slot1, group_slot2, group_gamma,
         cv_true, qualif_true, next_m, next_slot, n_teams, int(n_runs), float(beta),
     )
+    if group_matches_per_team is not None:
+        base = np.asarray(group_matches_per_team, dtype=np.int64)
+        return ko + base[None, :], team_names
     base = N_GROUP_MATCHES if include_group_matches else 0
     return ko + base, team_names
 
@@ -340,7 +387,7 @@ def _calib_top_counts(alpha, current_goals, nation_id, team_matches_runs, n_pois
 
 
 def calibrate_scorer_alphas(target_probs, nation_id, team_matches_runs, field_nation_id,
-                            current_goals=None, g_fav=5.0, p_grid=None, field_grid=None,
+                            current_goals=None, g_fav=6.0, p_grid=None, field_grid=None,
                             n_poisson_per_run=2, refine=True, verbose=True, seed=None):
     """
     Calibre les taux de but `alpha` (buts/match) pour que la fréquence simulée de
@@ -364,19 +411,27 @@ def calibrate_scorer_alphas(target_probs, nation_id, team_matches_runs, field_na
     MAE entre parts simulées des joueurs LISTÉS et `target_probs`.
 
     Paramètres :
-      target_probs      : (n_listed,) P(meilleur buteur) cible (dé-viggée Shin).
+      target_probs      : (n_listed,) P(meilleur buteur) cible (dé-viggée Shin) ;
+                          en IN-PLAY = devig des cotes buteur COURANTES.
       nation_id         : (n_listed,) index d'équipe de chaque joueur listé.
-      team_matches_runs : (n_runs, n_teams) matchs joués par équipe et par tournoi.
+      team_matches_runs : (n_runs, n_teams) matchs FUTURS joués par équipe et par
+                          tournoi simulé. Pré-tournoi = tournoi complet (3 poule + KO) ;
+                          IN-PLAY = matchs RESTANTS (cf. simulate_team_matches_played
+                          avec group_matches_per_team=compute_group_matches_remaining).
       field_nation_id   : (n_field,) nations des buteurs de fond (ex. np.arange(n_teams)).
-      current_goals     : (n_listed,) buts déjà marqués (0 avant tournoi ; le field
-                          est supposé à 0).
-      g_fav             : buts attendus du favori du marché (ancre de réalisme).
+      current_goals     : (n_listed,) buts DÉJÀ marqués (réels en in-play ; 0 avant
+                          tournoi ; le field est supposé à 0). Combinés aux matchs
+                          futurs : Y_final = current_goals + Poisson(alpha × M_restants).
+      g_fav             : buts TOTAUX (en fin de tournoi) attendus du favori du marché
+                          (ancre de réalisme). Sa part FUTURE calibrée = g_fav moins ses
+                          buts déjà marqués (évite le double comptage en in-play).
 
     Retour : (alpha (n_listed,), info dict {alpha_field, p, c, g_fav, mae, rankcorr,
               sim_probs, field_share}).
     """
     if seed is not None:
         np.random.seed(seed)
+        _seed_numba(seed)
 
     target = np.asarray(target_probs, dtype=np.float64)
     nation_id = np.asarray(nation_id, dtype=np.int64)
@@ -395,13 +450,23 @@ def calibrate_scorer_alphas(target_probs, nation_id, team_matches_runs, field_na
     nat_ext = np.concatenate([nation_id, field_nation_id])
     cg_ext = np.concatenate([current_goals, np.zeros(n_field)])
 
+    # Ancre de réalisme par TOTAL : le favori du marché finit à `g_fav` buts au total.
+    # Sa composante FUTURE (à modéliser par Poisson) = g_fav - ses buts DÉJÀ marqués.
+    # Pré-tournoi (current_goals=0) total = future. En in-play, retrancher les buts
+    # déjà acquis évite le DOUBLE COMPTAGE (sinon alpha capte la cote courte d'un
+    # joueur en tête alors qu'elle vient surtout de ses buts déjà marqués).
+    g_future_fav = max(0.5, g_fav - float(current_goals[int(np.argmax(s))]))
+
     if p_grid is None:
-        p_grid = np.arange(0.30, 1.01, 0.05)
+        # Plancher 0.15 : l'optimum typique (p≈0.27) doit être INTÉRIEUR à la grille
+        # (sinon il est rattrapé de justesse par le refine et le balayage affiche un
+        # p* figé au plancher). p<0.20 dégrade nettement le MAE -> jamais retenu.
+        p_grid = np.arange(0.15, 1.01, 0.05)
     if field_grid is None:
         field_grid = np.arange(0.00, 0.81, 0.05)
 
     def _eval(p, af):
-        c = g_fav / (tmax ** p)
+        c = g_future_fav / (tmax ** p)
         alpha = (c * s ** p) / EM
         al_ext = np.concatenate([alpha, np.full(n_field, af)])
         sim = _calib_top_counts(al_ext, cg_ext, nat_ext, team_matches_runs, int(n_poisson_per_run))

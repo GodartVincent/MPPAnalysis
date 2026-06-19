@@ -43,6 +43,79 @@ def test_drift_plus_fort_pour_matchs_lointains():
 
 
 # ---------------------------------------------------------------------------
+# apply_temporal_drift — régime DATE (diffusion + phase, variances additives)
+# ---------------------------------------------------------------------------
+def test_drift_date_match_courant_fige():
+    """Le match courant/passé (i <= current_match_idx) reste figé même en régime date."""
+    phases = ["Poule_J1"] * 3
+    tp = np.array([[0.5, 0.3, 0.2]] * 3, dtype=np.float64)
+    dates = np.array(["2026-06-17", "2026-06-20", "2026-06-24"], dtype="datetime64[ns]")
+    np.random.seed(0)
+    out = np.array([
+        apply_temporal_drift(tp, phases, current_match_idx=0,
+                             match_dates=dates, reference_date="2026-06-17")
+        for _ in range(300)
+    ])
+    assert np.allclose(out[:, 0, :], tp[0])
+    # Les matchs futurs (1 et 2) sont bien driftés
+    assert out[:, 1, :].var(axis=0).mean() > 0.0
+    assert out[:, 2, :].var(axis=0).mean() > 0.0
+
+
+def test_drift_date_diffusion_ajoute_de_la_variance():
+    """À phase ÉGALE, un match plus lointain en jours est plus drifté (composante diffusion)."""
+    phases = ["Poule_J1"] * 3  # même phase -> composante phase constante
+    tp = np.array([[0.5, 0.3, 0.2]] * 3, dtype=np.float64)
+    dates = np.array(["2026-06-17", "2026-06-18", "2026-07-05"], dtype="datetime64[ns]")  # +1 j / +18 j
+    np.random.seed(0)
+    out = np.array([
+        apply_temporal_drift(tp, phases, current_match_idx=0,
+                             match_dates=dates, reference_date="2026-06-17")
+        for _ in range(6000)
+    ])
+    var_proche = out[:, 1, :].var(axis=0).mean()    # +1 j
+    var_lointain = out[:, 2, :].var(axis=0).mean()  # +18 j
+    assert var_lointain > var_proche
+    # Sorties bornées et normalisées
+    assert np.allclose(out.sum(axis=2), 1.0)
+    assert out.min() >= MIN_TRUE_PROBA - 1e-6
+    assert out.max() <= MAX_TRUE_PROBA + 1e-6
+
+
+def test_drift_date_combine_phase_et_diffusion():
+    """Régime date = sqrt(diffusion^2 + phase^2) > la composante phase seule (d > 0)."""
+    phases = ["Poule_J1", "Poule_J2"]  # match 1 : 1 phase d'écart
+    tp = np.array([[0.5, 0.3, 0.2]] * 2, dtype=np.float64)
+    dates = np.array(["2026-06-17", "2026-06-24"], dtype="datetime64[ns]")  # +7 j
+    n = 8000
+    np.random.seed(0)
+    out_date = np.array([
+        apply_temporal_drift(tp, phases, current_match_idx=0,
+                             match_dates=dates, reference_date="2026-06-17")
+        for _ in range(n)
+    ])
+    np.random.seed(0)
+    out_phase = np.array([
+        apply_temporal_drift(tp, phases, current_match_idx=0)  # phase seule (pas de dates)
+        for _ in range(n)
+    ])
+    var_date = out_date[:, 1, :].var(axis=0).mean()
+    var_phase = out_phase[:, 1, :].var(axis=0).mean()
+    assert var_date > var_phase  # la diffusion ajoute de la variance par-dessus la phase
+
+
+def test_drift_date_reference_today_par_defaut_ok():
+    """reference_date=None -> date.today() : exécution sans erreur, sortie normalisée/bornée."""
+    phases = ["Poule_J1", "Poule_J2", "Poule_J3"]
+    tp = np.array([[0.5, 0.3, 0.2]] * 3, dtype=np.float64)
+    dates = np.array(["2026-06-11", "2026-06-18", "2026-06-24"], dtype="datetime64[ns]")
+    np.random.seed(0)
+    out = apply_temporal_drift(tp, phases, current_match_idx=0, match_dates=dates)
+    assert np.allclose(out.sum(axis=1), 1.0)
+    assert np.isfinite(out).all()
+
+
+# ---------------------------------------------------------------------------
 # estimate_crowd_3D
 # ---------------------------------------------------------------------------
 def test_crowd_somme_a_un_et_plancher():

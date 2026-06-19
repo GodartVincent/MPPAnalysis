@@ -278,7 +278,7 @@ def poules_horizon_from_full(V_full):
         V = V[None, ...]
     return V
 
-def conditional_matchup_prob(cv_inv_a, surv_a, cv_inv_b, surv_b, beta=0.95, eps=1e-6):
+def conditional_matchup_prob(cv_inv_a, surv_a, cv_inv_b, surv_b, beta=0.89, eps=1e-6):
     """
     Probabilité que l'équipe A batte B dans un match knockout, à partir de leurs
     FORCES CONDITIONNELLES plutôt que du simple ratio des cotes de victoire finale.
@@ -294,7 +294,7 @@ def conditional_matchup_prob(cv_inv_a, surv_a, cv_inv_b, surv_b, beta=0.95, eps=
     de gros morceaux (faible surv -> ratio cv/surv élevé), sous hypothèse
     d'indépendance des matchs.
 
-    beta : exposant d'AMORTISSEMENT du conditionnement (par défaut 0.95, calibré via
+    beta : exposant d'AMORTISSEMENT du conditionnement (par défaut 0.89, calibré via
            le notebook 23 pour que les fréquences de titre simulées collent à 1/cote_victoire).
       - beta = 1.0 : conditionnement COMPLET = cv_inv / surv (identité bayésienne
                      exacte sous indépendance).
@@ -311,7 +311,7 @@ def conditional_matchup_prob(cv_inv_a, surv_a, cv_inv_b, surv_b, beta=0.95, eps=
     return 0.5 if total <= 0.0 else s_a / total
 
 
-def generate_bracket_scenario(df_odds, df_tournoi=None, beta=0.95):
+def generate_bracket_scenario(df_odds, df_tournoi=None, beta=0.89):
     """
     Simulateur Universel (Avant-tournoi & Horizon Glissant).
     beta : amortissement de la force conditionnelle (cf. conditional_matchup_prob).
@@ -480,7 +480,7 @@ def _resolve_known_pick(known, idx, valid_names, kind):
 
 
 def compute_robust_endgame_horizon(my_fav, my_scorer, path_poules="data/CDM_2026.csv",
-                                   n_simulations=15, save=True, verbose=True, beta=0.95,
+                                   n_simulations=15, save=True, verbose=True, beta=0.89,
                                    known_favorites=None, known_scorers=None, n_poisson=2000,
                                    market_path="data/CDM_2026_goal_scorer_and_favorite.csv"):
     """
@@ -804,7 +804,7 @@ def compute_robust_endgame_horizon(my_fav, my_scorer, path_poules="data/CDM_2026
     return V_start_1001
 
 
-def simulate_champion_distribution(df_odds, n_runs=200_000, beta=0.95, verbose=True, seed=None):
+def simulate_champion_distribution(df_odds, n_runs=200_000, beta=0.89, verbose=True, seed=None):
     """
     Simule n_runs tournois complets (poules + bracket) et compte combien de fois
     chaque équipe est CHAMPIONNE (gagnante de la finale, match 31).
@@ -915,6 +915,6 @@ def simulate_champion_distribution(df_odds, n_runs=200_000, beta=0.95, verbose=T
 if __name__ == "__main__":
     # Test avec 15 arbres pour être rapide au quotidien (Modifiable le Jour J)
     # ~486 s/itération sur CPU (i5-12400) ; 15 itérations = ~1h15 ; 2 itérations = ~10 min.
-    compute_robust_endgame_horizon(my_fav="espagne", my_scorer="autre", n_simulations=67,
-                                   known_favorites=["france", "france", "france", "france", "espagne"],
-                                   known_scorers=  ["autre", "autre", "autre", "harry_kane", "harry_kane"])
+    compute_robust_endgame_horizon(my_fav="france", my_scorer="autre", n_simulations=100,
+                                   known_favorites=["espagne", "espagne", "france", "france", "france", "espagne"],
+                                   known_scorers=  ["harry_kane", "harry_kane", "autre", "autre", "harry_kane", "kylian_mbappe"],)
