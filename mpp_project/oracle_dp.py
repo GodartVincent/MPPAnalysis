@@ -605,7 +605,8 @@ def _esp_coarse_exact(val_g1, val_g2, ap_norm, ap_boost, o, cc, b_half,
 @njit(parallel=True)
 def solve_dp_coarse_exact(sc_outcome, sc_p, sc_cc, sc_bonus, sc_count,
                           gains_1N2, crowd_1N2, p_empirique_1D, alphas_isolement,
-                          V_horizon, stop_t=0, start_t=-1):
+                          V_horizon, stop_t=0, start_t=-1, store_q_count=0,
+                          store_floor=False):
     """
     Variante EXACT-AWARE de solve_dp_coarse (501², demi-points). Chaque match `t`
     porte K_t « scores » (paddés) : 1N2 -> 3 pseudo-scores (outcomes 0/1/2, bonus 0) ;
@@ -623,12 +624,30 @@ def solve_dp_coarse_exact(sc_outcome, sc_p, sc_cc, sc_bonus, sc_count,
     score exact) ; on calcule les sommes Bob×peloton pour ces 3 niveaux puis on
     assemble la valeur de chaque action.
 
-    Renvoie V_all_matches (n_matches, 501, 501, 2).
+    `store_q_count` (>0) : stocke en plus les valeurs PAR ACTION (sous-produit déjà
+    calculé, jeté sinon) pour les `store_q_count` premiers matchs de la fenêtre, soit
+    t in [stop_t, stop_t+store_q_count). Sert à la PASSE FORWARD (NB10) : Q_store[k,g1,g2,
+    ks,:] = [base, keep, use] = WR de parier le score ks à l'état (g1,g2) du match
+    stop_t+k, chaîné sur V_{suivant}. Quand 0 -> Q_store vide (placeholder).
+
+    `store_floor` (True, avec store_q_count>0) : stocke EN PLUS Q_store_floor, le PLANCHER
+    « WR si l'agent loupe son score exact » (l'agent ne touche que le gain d'outcome, pas
+    le bonus de score ; Bob/peloton gardent leur bonus). C'est exactement la valeur par
+    action SANS le terme dC (= l'incrément du bonus AGENT), déjà calculé ici -> coût
+    compute ~nul, seul un tableau supplémentaire est alloué. Pendant de
+    evaluate_exact_score_day(..., agent_bonus_factor=0.0) pour le match du jour, mais sur
+    toute la grille. Sert à la colonne 'WR outcome' des matchs forward (NB10). Vide si False.
+
+    Renvoie (V_all_matches (n_matches,501,501,2), Q_store (store_q_count,501,501,Kmax,3),
+    Q_store_floor (store_q_count,501,501,Kmax,3) si store_floor sinon (0,...)).
     """
     n_matches = sc_outcome.shape[0]
     Kmax = sc_outcome.shape[1]
 
     V_all_matches = np.zeros((n_matches, 501, 501, 2), dtype=np.float32)
+    Q_store = np.zeros((store_q_count, 501, 501, Kmax, 3), dtype=np.float32)
+    floor_count = store_q_count if store_floor else 0
+    Q_store_floor = np.zeros((floor_count, 501, 501, Kmax, 3), dtype=np.float32)
     V_next = np.copy(V_horizon)
 
     # 1. Condition terminale (run complet uniquement)
@@ -660,6 +679,8 @@ def solve_dp_coarse_exact(sc_outcome, sc_p, sc_cc, sc_bonus, sc_count,
         gains_t = gains_1N2[t]
         crowd_t = crowd_1N2[t]
         hist_t = p_empirique_1D[t]
+        store = (t - stop_t) < store_q_count   # t >= stop_t dans la boucle
+        kq = t - stop_t
 
         for g1 in prange(501):
             val_g1 = g1 - 300
@@ -723,6 +744,17 @@ def solve_dp_coarse_exact(sc_outcome, sc_p, sc_cc, sc_bonus, sc_count,
                     bb1 = max(v_keep, v_use)
                     if bb1 > best_b1:
                         best_b1 = bb1
+                    if store:
+                        Q_store[kq, g1, g2, ka, 0] = v_b0
+                        Q_store[kq, g1, g2, ka, 1] = v_keep
+                        Q_store[kq, g1, g2, ka, 2] = v_use
+                        if store_floor:
+                            # Plancher = valeur par action SANS le bonus AGENT (terme dC) :
+                            # l'agent ne garde que le gain d'outcome ; Bob/peloton conservent
+                            # leur bonus (déjà dans totalA/Ain/Bin via _esp_coarse_exact).
+                            Q_store_floor[kq, g1, g2, ka, 0] = v_b0 - dC[ka, 0]
+                            Q_store_floor[kq, g1, g2, ka, 1] = v_keep - dC[ka, 1]
+                            Q_store_floor[kq, g1, g2, ka, 2] = v_use - dC[ka, 2]
 
                 V_current[g1, g2, 0] = best_b0
                 V_current[g1, g2, 1] = best_b1
@@ -732,11 +764,156 @@ def solve_dp_coarse_exact(sc_outcome, sc_p, sc_cc, sc_bonus, sc_count,
             for g2 in range(g1 + 1, 501):
                 V_current[g2, g1, 0] = V_current[g1, g2, 0]
                 V_current[g2, g1, 1] = V_current[g1, g2, 1]
+                if store:
+                    for ka in range(Kmax):
+                        Q_store[kq, g2, g1, ka, 0] = Q_store[kq, g1, g2, ka, 0]
+                        Q_store[kq, g2, g1, ka, 1] = Q_store[kq, g1, g2, ka, 1]
+                        Q_store[kq, g2, g1, ka, 2] = Q_store[kq, g1, g2, ka, 2]
+                        if store_floor:
+                            Q_store_floor[kq, g2, g1, ka, 0] = Q_store_floor[kq, g1, g2, ka, 0]
+                            Q_store_floor[kq, g2, g1, ka, 1] = Q_store_floor[kq, g1, g2, ka, 1]
+                            Q_store_floor[kq, g2, g1, ka, 2] = Q_store_floor[kq, g1, g2, ka, 2]
 
         V_next = V_current
         V_all_matches[t] = V_current
 
-    return V_all_matches
+    return V_all_matches, Q_store, Q_store_floor
+
+
+@njit
+def _lk_coarse_idx(val_g1, val_g2, ap, bob_g, pel_delta, alpha):
+    """Indices coarse (i1,i2) de l'état d'arrivée (cf. _lk_coarse, mais renvoie l'index)."""
+    ngb = val_g1 + ap - bob_g
+    ngp = val_g2 + ap - pel_delta
+    vg1 = min(ngb, ngp)
+    vg2 = alpha * max(ngb, ngp) + (1.0 - alpha) * ngp
+    i1 = max(0, min(500, int(round(vg1)) + 300))
+    i2 = max(0, min(500, int(round(vg2)) + 300))
+    return i1, i2
+
+
+@njit
+def forward_propagate_exact(P_in, sc_outcome_t, sc_p_t, sc_cc_t, sc_bonus_t, K,
+                            gains_t, crowd_t, hist_t, alpha, Q_t):
+    """
+    PASSE FORWARD (un match) : propage la distribution d'occupation des états à travers
+    le match `t`, en suivant la POLITIQUE OPTIMALE (déduite de Q_t), pour obtenir la
+    distribution des états (g1, g2, booster) JUSTE AVANT le match suivant.
+
+    P_in (501,501,2) : masse de proba par état (couche 0 = booster déjà utilisé,
+    couche 1 = booster encore en main). Convention triangle supérieur g1<=g2 (les
+    transitions la préservent). Renvoie P_out (501,501,2), même convention, masse totale
+    conservée (chaque source est redistribuée intégralement -> Σ p_branches = 1).
+
+    Politique : si booster en main (b=1), on compare le meilleur WR keep vs use sur les
+    scores valides (Q_t[...,1] / Q_t[...,2]) -> on garde ou on pose le x2 ; sinon (b=0)
+    on prend l'argmax base (Q_t[...,0]). L'action choisie (un score) fixe les points de
+    l'agent par score RÉEL ks, Bob et le peloton décrochant le bonus du score réel avec
+    proba cc (mêmes branches que evaluate_exact_score_day / _esp_coarse_exact).
+    """
+    P_out = np.zeros((501, 501, 2), dtype=np.float64)
+    max_gain = hist_t.shape[1]
+
+    for g1 in range(501):
+        val_g1 = g1 - 300
+        for g2 in range(g1, 501):
+            val_g2 = g2 - 300
+            for b in range(2):
+                mass = P_in[g1, g2, b]
+                if mass == 0.0:
+                    continue
+
+                # --- Politique optimale à cet état ---
+                if b == 1:
+                    a_keep = 0
+                    a_use = 0
+                    v_keep = -1.0e18
+                    v_use = -1.0e18
+                    for ka in range(K):
+                        if Q_t[g1, g2, ka, 1] > v_keep:
+                            v_keep = Q_t[g1, g2, ka, 1]
+                            a_keep = ka
+                        if Q_t[g1, g2, ka, 2] > v_use:
+                            v_use = Q_t[g1, g2, ka, 2]
+                            a_use = ka
+                    if v_use > v_keep:
+                        action = a_use
+                        use = True
+                        b_next = 0
+                    else:
+                        action = a_keep
+                        use = False
+                        b_next = 1
+                else:
+                    a_base = 0
+                    v_base = -1.0e18
+                    for ka in range(K):
+                        if Q_t[g1, g2, ka, 0] > v_base:
+                            v_base = Q_t[g1, g2, ka, 0]
+                            a_base = ka
+                    action = a_base
+                    use = False
+                    b_next = 0
+
+                o_a = sc_outcome_t[action]
+                ba_half = sc_bonus_t[action] / 2.0
+
+                # --- Scatter de la masse sur les transitions (score réel ks) ---
+                for ks in range(K):
+                    p_s = sc_p_t[ks]
+                    if p_s == 0.0:
+                        continue
+                    o = sc_outcome_t[ks]
+                    cc = sc_cc_t[ks]
+                    bs_half = sc_bonus_t[ks] / 2.0
+                    gh = gains_t[o] / 2.0
+                    # Points agent (demi) : gain d'outcome si bon outcome + bonus si score exact
+                    ap = (gh if o_a == o else 0.0) + (ba_half if action == ks else 0.0)
+                    ap_eff = 2.0 * ap if use else ap
+                    hist_o = hist_t[o]
+
+                    for bob_a in range(3):
+                        p_bob = crowd_t[bob_a]
+                        if p_bob == 0.0:
+                            continue
+                        bob_correct = (bob_a == o)
+                        for bob_branch in range(2):
+                            if bob_correct:
+                                if bob_branch == 0:
+                                    p_bb = p_bob * cc
+                                    bob_g = gh + bs_half
+                                else:
+                                    p_bb = p_bob * (1.0 - cc)
+                                    bob_g = gh
+                            else:
+                                if bob_branch == 1:
+                                    continue
+                                p_bb = p_bob
+                                bob_g = 0.0
+                            if p_bb == 0.0:
+                                continue
+                            for dg in range(max_gain):
+                                p_pel = hist_o[dg]
+                                if p_pel == 0.0:
+                                    continue
+                                dgc = dg / 2.0
+                                if dg != 0:
+                                    for pel_branch in range(2):
+                                        if pel_branch == 0:
+                                            p_pb = p_pel * cc
+                                            pel_delta = dgc + bs_half
+                                        else:
+                                            p_pb = p_pel * (1.0 - cc)
+                                            pel_delta = dgc
+                                        if p_pb == 0.0:
+                                            continue
+                                        i1, i2 = _lk_coarse_idx(val_g1, val_g2, ap_eff, bob_g, pel_delta, alpha)
+                                        P_out[i1, i2, b_next] += mass * p_s * p_bb * p_pb
+                                else:
+                                    i1, i2 = _lk_coarse_idx(val_g1, val_g2, ap_eff, bob_g, dgc, alpha)
+                                    P_out[i1, i2, b_next] += mass * p_s * p_bb * p_pel
+
+    return P_out
 
 
 @njit(parallel=True)

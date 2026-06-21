@@ -19,6 +19,7 @@ from mpp_project.core import (
     ExactScoreMarket,
     build_exact_score_market,
     correct_cond_crowd,
+    _fit_poisson_lambdas,
     exact_score_bonus,
     expected_mpp_points,
     expected_simple_points,
@@ -28,9 +29,10 @@ from mpp_project.core import (
 from mpp_project.core import load_exact_scores_by_match
 from mpp_project.oracle_dp import (
     evaluate_exact_score_day, solve_dp_coarse, solve_dp_coarse_exact,
+    forward_propagate_exact,
     GAP_OFFSET, GAP_MIN, GAP_MAX,
 )
-from mpp_project.daily_pipeline import run_daily_pipeline
+from mpp_project.daily_pipeline import run_daily_pipeline, eval_exact_market_forward
 from tests.helpers import build_pipeau_dataframe, build_ghost_peloton, build_terminal_horizon
 
 TOL = 1e-4
@@ -114,13 +116,49 @@ def test_shape_correction_0_0_seul_no_op():
 
 
 def test_correct_cond_crowd_garde_zeros():
-    """Un score à crowd conditionnel nul reste nul (inatteignable depuis cc_wmx)."""
+    """Repli (sans crowd 1N2) : pénalité 0-0 seule ; un score à crowd nul reste nul."""
     scores = ["0-0", "1-1", "2-2"]
     outcomes = np.array([1, 1, 1])
     cc = np.array([0.7, 0.3, 0.0])          # 2-2 jamais joué côté Winamax
-    out = correct_cond_crowd(cc, scores, outcomes)
+    out = correct_cond_crowd(cc, scores, outcomes)   # mpp_outcome_crowd=None -> fallback
     assert out[2] == 0.0
     assert out.sum() == pytest.approx(1.0)
+
+
+def test_fit_poisson_lambdas_matches_regions():
+    """Les λ ajustés reproduisent les masses 1N2 cibles (victoire dom / ext)."""
+    from scipy.stats import poisson
+    for q in ([0.50, 0.30, 0.20], [0.88, 0.08, 0.04], [0.20, 0.30, 0.50]):
+        l1, l2 = _fit_poisson_lambdas(np.array(q))
+        gi = np.arange(11)
+        J = np.outer(poisson.pmf(gi, l1), poisson.pmf(gi, l2))
+        win, los = np.tril(J, -1).sum(), np.triu(J, 1).sum()
+        assert win == pytest.approx(q[0], abs=0.05)
+        assert los == pytest.approx(q[2], abs=0.05)
+
+
+def test_surface_injecte_les_zeros():
+    """Avec mpp_outcome_crowd, la surface Poisson INJECTE de la masse sur les scores à
+    crowd Winamax nul (cc_wmx=0 -> cc>0), ce que le repli 0-0 ne peut pas faire."""
+    data = {
+        "1-0": (3.0, 30.0), "2-0": (5.0, 20.0), "3-0": (9.0, 0.0),  # victoire ; 3-0 crowd 0
+        "0-0": (8.0, 10.0), "1-1": (7.0, 0.0),                       # nul ; 1-1 crowd 0
+        "0-1": (12.0, 5.0),                                           # défaite
+    }
+    op = np.array([0.60, 0.25, 0.15])
+    mpp = np.array([0.65, 0.20, 0.15])
+    fb = build_exact_score_market(data, outcome_probas=op)                       # repli
+    new = build_exact_score_market(data, outcome_probas=op, mpp_outcome_crowd=mpp)
+
+    i30, i11 = new.scores.index("3-0"), new.scores.index("1-1")
+    assert fb.cond_crowd[i30] == 0.0 and fb.cond_crowd[i11] == 0.0   # repli : restent nuls
+    assert new.cond_crowd[i30] > 0.0 and new.cond_crowd[i11] > 0.0   # surface : injectés
+    # crowd conditionnel toujours normalisé PAR OUTCOME
+    for o in (0, 1, 2):
+        s = new.cond_crowd[np.asarray(new.outcomes) == o].sum()
+        assert s == pytest.approx(1.0, abs=1e-9)
+    # bonus cohérent : un score injecté (rare) garde un bonus élevé
+    assert new.bonus[i30] >= 50
 
 
 def test_build_market_creux_renormalise():
@@ -483,11 +521,58 @@ def test_coarse_exact_equals_coarse_1N2():
     V0 = np.zeros((501, 501, 2), dtype=np.float32)  # écrasé par le terminal (start_t=-1)
 
     sc_o, sc_p, sc_cc, sc_b, sc_n = _coarse_1N2_sc(tp)
-    V_exact = solve_dp_coarse_exact(sc_o, sc_p, sc_cc, sc_b, sc_n, ga, cr, hist, al,
-                                    V0, stop_t=0, start_t=-1)
+    V_exact, _, _ = solve_dp_coarse_exact(sc_o, sc_p, sc_cc, sc_b, sc_n, ga, cr, hist, al,
+                                          V0, stop_t=0, start_t=-1)
     V_ref, _ = solve_dp_coarse(tp, cr, ga, hist, al, V0, stop_t=0, horizon_nuit=0, start_t=-1)
 
     assert np.allclose(V_exact, V_ref, atol=1e-4), f"écart max {np.abs(V_exact - V_ref).max():.2e}"
+
+
+def test_coarse_exact_floor_store():
+    """Q_store_floor (store_floor=True) = plancher 'WR outcome' (agent sans bonus de
+    score). Invariants : tout-1N2 (bonus 0) -> identique à Q_store (dC nul) ; avec bonus
+    -> plancher <= Q_store partout (dC >= 0), et strictement plus bas quelque part."""
+    n, max_gain = 3, 20
+    cr = np.array([[0.45, 0.35, 0.20]] * n, dtype=np.float64)
+    ga = np.array([[40, 30, 50]] * n, dtype=np.float64)
+    hist = np.zeros((n, 3, max_gain), dtype=np.float64)
+    hist[:, :, 0] = 0.5
+    hist[:, :, 6] = 0.5
+    al = np.full(n, 0.3, dtype=np.float64)
+    V0 = np.zeros((501, 501, 2), dtype=np.float32)
+
+    # (a) tout-1N2 : bonus 0 -> dC nul -> plancher identique à Q_store (au bit près).
+    tp = np.array([[0.50, 0.30, 0.20]] * n, dtype=np.float64)
+    sc_o, sc_p, sc_cc, sc_b, sc_n = _coarse_1N2_sc(tp)
+    _, Q_store, Q_floor = solve_dp_coarse_exact(
+        sc_o, sc_p, sc_cc, sc_b, sc_n, ga, cr, hist, al, V0,
+        stop_t=0, start_t=-1, store_q_count=n, store_floor=True)
+    assert Q_floor.shape == Q_store.shape
+    assert np.array_equal(Q_floor, Q_store), "1N2 (bonus 0) : plancher == Q_store"
+
+    # store_floor=False -> Q_store_floor vide (placeholder).
+    _, _, Q_floor_off = solve_dp_coarse_exact(
+        sc_o, sc_p, sc_cc, sc_b, sc_n, ga, cr, hist, al, V0,
+        stop_t=0, start_t=-1, store_q_count=n, store_floor=False)
+    assert Q_floor_off.shape[0] == 0
+
+    # (b) scores exacts avec bonus : plancher <= Q_store partout, strict quelque part.
+    Kmax = 4
+    sc_o2 = np.zeros((n, Kmax), dtype=np.int8)
+    sc_p2 = np.zeros((n, Kmax), dtype=np.float64)
+    sc_cc2 = np.zeros((n, Kmax), dtype=np.float64)
+    sc_b2 = np.zeros((n, Kmax), dtype=np.float64)
+    sc_n2 = np.full(n, Kmax, dtype=np.int64)
+    for t in range(n):
+        sc_o2[t] = [0, 0, 1, 2]                 # 1-0, 2-0, 0-0, 0-1
+        sc_p2[t] = [0.30, 0.20, 0.30, 0.20]
+        sc_cc2[t] = [0.5, 0.5, 1.0, 1.0]
+        sc_b2[t] = [50.0, 70.0, 30.0, 60.0]
+    _, Q_store2, Q_floor2 = solve_dp_coarse_exact(
+        sc_o2, sc_p2, sc_cc2, sc_b2, sc_n2, ga, cr, hist, al, V0,
+        stop_t=0, start_t=-1, store_q_count=n, store_floor=True)
+    assert (Q_floor2 <= Q_store2 + 1e-5).all(), "plancher doit rester <= Q_store"
+    assert (Q_floor2 < Q_store2 - 1e-6).any(), "le bonus agent doit faire baisser le plancher"
 
 
 MULTI_DATA = {
@@ -531,3 +616,98 @@ def test_pipeline_multi_exact(tmp_path):
         assert {"Score", "WR base (%)", "WR outcome (%)", "E[pts MPP]"} <= set(df_m.columns)
     # le 1er élément = reco du match courant (id=1)
     assert (reco, wr) == (night_markets[1][0], night_markets[1][1])
+
+
+# ===========================================================================
+# 4. PASSE FORWARD (WR moyen par score sur la distribution d'états atteignable)
+# ===========================================================================
+def test_forward_propagate_mass_conservation():
+    """forward_propagate_exact conserve la masse et reste dans le triangle g1<=g2
+    (histogrammes peloton propres = somme 1 par outcome)."""
+    Kmax = 4
+    sc_o = np.array([0, 1, 2, 0], dtype=np.int8)
+    sc_p = np.array([0.4, 0.3, 0.2, 0.1], dtype=np.float64)   # somme 1
+    sc_cc = np.array([0.5, 0.0, 0.0, 0.5], dtype=np.float64)
+    sc_b = np.array([50.0, 0.0, 0.0, 30.0], dtype=np.float64)
+    K = 4
+    gains = np.array([40.0, 30.0, 50.0], dtype=np.float64)
+    crowd = np.array([0.45, 0.35, 0.20], dtype=np.float64)    # somme 1
+    max_gain = 20
+    hist = np.zeros((3, max_gain), dtype=np.float64)
+    hist[:, 0] = 0.5
+    hist[:, 4] = 0.5                                          # somme 1 par outcome
+    alpha = 0.3
+    Q = np.zeros((501, 501, Kmax, 3), dtype=np.float32)       # politique triviale -> action 0
+
+    P = np.zeros((501, 501, 2), dtype=np.float64)
+    P[300, 320, 1] = 1.0                                      # booster en main, g1<=g2
+    P_out = forward_propagate_exact(P, sc_o, sc_p, sc_cc, sc_b, K,
+                                    gains, crowd, hist, alpha, Q)
+
+    assert abs(P_out.sum() - 1.0) < 1e-9, f"masse {P_out.sum()}"
+    # reste dans le triangle supérieur (g1 <= g2)
+    assert np.allclose(np.tril(P_out.sum(axis=2), -1), 0.0)
+
+
+def test_forward_eval_lit_Q_a_l_etat_delta():
+    """eval_exact_market_forward avec P concentrée sur un seul état (booster en main)
+    reproduit exactement les Q par-action à cet état."""
+    market = build_exact_score_market({"1-0": (3.0, 30.0), "0-0": (8.0, 15.0), "0-1": (7.0, 12.0)})
+    K = len(market.scores)
+    Q = np.zeros((501, 501, K, 3), dtype=np.float32)
+    g1, g2 = 290, 310
+    for s in range(K):
+        Q[g1, g2, s, 0] = 0.10 + 0.01 * s
+        Q[g1, g2, s, 1] = 0.20 + 0.01 * s
+        Q[g1, g2, s, 2] = 0.15 + 0.02 * s
+    P = np.zeros((501, 501, 2), dtype=np.float64)
+    P[g1, g2, 1] = 1.0    # toute la masse, booster en main
+
+    reco, wr, df = eval_exact_market_forward(
+        market, P, Q, has_booster=1,
+        gains_match=np.array([40, 30, 50]), noms_choix=["1", "N", "2"],
+    )
+    assert np.allclose(df["WR base (%)"].values, Q[g1, g2, :, 0] * 100.0, atol=1e-3)
+    assert np.allclose(df["WR keep (%)"].values, Q[g1, g2, :, 1] * 100.0, atol=1e-3)
+    assert np.allclose(df["WR x2 (%)"].values, Q[g1, g2, :, 2] * 100.0, atol=1e-3)
+    # reco = meilleur (score, timing) : keep du dernier score (0.22) > meilleur x2 (0.19)
+    assert reco == "0-1 (Safe)"
+    assert abs(wr - 0.22) < 1e-3
+
+
+def test_pipeline_forward_use_split(tmp_path):
+    """Chemin use_split exact-aware : la passe forward s'active pour les matchs k>=1
+    (night_markets valides). La colonne 'WR outcome' (plancher sans bonus agent) est
+    désormais fournie PARTOUT : éval fine au match courant, et via Q_store_floor pour
+    les matchs forward. Le plancher reste <= au meilleur WR (avec bonus)."""
+    n = 12
+    df = build_pipeau_dataframe(
+        n_matchs=n,
+        true_proba=np.array([0.50, 0.30, 0.20]),
+        crowd=np.array([0.45, 0.30, 0.25]),
+        gains=np.array([50, 40, 60], dtype=np.int64),
+    )
+    path = tmp_path / "fwd.csv"
+    df.to_csv(path, index=False)
+
+    data = {"1-0": (3.0, 30.0), "1-1": (5.0, 25.0), "0-1": (7.0, 20.0)}
+    multi = {i: dict(data) for i in (1, 2, 3)}
+
+    out = run_daily_pipeline(
+        csv_path=path, match_id_cible=1, mon_gap_1=-30, mon_gap_2=0, has_booster=1,
+        use_drift=True, horizon_nuit=3, nb_scenarios=1, near_horizon=5,
+        p_empirique_override=build_ghost_peloton(n, max_gain=250),
+        v_horizon_override=build_terminal_horizon(),
+        save_abaques=False, validate_input=False, exact_scores_by_match=multi,
+    )
+    reco, wr, market_df, q_jour, night_markets = out
+    assert set(night_markets.keys()) == {1, 2, 3}
+    for mid, (reco_m, wr_m, df_m) in night_markets.items():
+        assert 0.0 <= wr_m <= 1.0, f"match {mid}: WR {wr_m}"
+        assert reco_m.split(" ")[0] in set(data.keys())
+    # Colonne plancher 'WR outcome' présente PARTOUT : k=0 (éval fine) ET k>=1 (forward
+    # via Q_store_floor). Le plancher (agent sans bonus) <= meilleur WR (avec bonus).
+    for mid, (_, _, df_m) in night_markets.items():
+        assert "WR outcome (%)" in df_m.columns, f"match {mid}"
+        wr_best = df_m[["WR keep (%)", "WR x2 (%)"]].max(axis=1)
+        assert (df_m["WR outcome (%)"] <= wr_best + 1e-3).all(), f"match {mid}: plancher > WR best"

@@ -5,7 +5,7 @@ from datetime import date
 from pathlib import Path
 
 from mpp_project.core import apply_heteroscedastic_noise, apply_temporal_drift, build_exact_score_market, calculate_true_outcome_probas_from_odds, estimate_crowd_3D, expected_mpp_points, expected_simple_points, normalize_crowds, validate_match_dataframe
-from mpp_project.oracle_dp import compute_alphas_isolement, compute_full_Q_table, evaluate_exact_score_day, solve_dp_coarse, solve_dp_coarse_exact, GAP_MIN, GAP_MAX, GAP_OFFSET
+from mpp_project.oracle_dp import compute_alphas_isolement, compute_full_Q_table, evaluate_exact_score_day, forward_propagate_exact, solve_dp_coarse, solve_dp_coarse_exact, GAP_MIN, GAP_MAX, GAP_OFFSET
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_DIR / "data"
@@ -169,7 +169,8 @@ def run_daily_pipeline(
             idx = int(mid) - 1
             if idx < match_idx or idx >= n_matches:
                 continue  # match déjà joué ou hors tournoi
-            mkt = build_exact_score_market(data, outcome_probas=base_true_probas[idx], shape_correction=True)
+            mkt = build_exact_score_market(data, outcome_probas=base_true_probas[idx],
+                                           shape_correction=True, mpp_outcome_crowd=base_crowds[idx])
             markets_by_idx[idx] = mkt
             Kmax = max(Kmax, len(mkt.scores))
         if match_idx not in markets_by_idx:
@@ -236,14 +237,26 @@ def run_daily_pipeline(
     # --- Phase 2 : DP PROCHE coarse (sans drift, 1 seul run) ---
     # Drift quasi nul sur les matchs proches (alpha_bayes ≈ 0.95 → rmse ≈ 0.4%).
     # Condition limite = V_far_avg (incertitude future déjà encodée).
+    # Sous-produits pour la PASSE FORWARD (matchs de nuit, k>=1). Restent None hors du
+    # chemin use_split exact-aware -> les autres chemins gardent l'éval au gap courant.
+    Q_near = None
+    Q_near_floor = None
+    sc_fwd = None
     if use_split:
         if exact_multi:
             sc_o, sc_p, sc_cc, sc_b, sc_n = _build_sc(base_true_probas)
-            V_near = solve_dp_coarse_exact(
+            V_near, Q_near, Q_near_floor = solve_dp_coarse_exact(
                 sc_o, sc_p, sc_cc, sc_b, sc_n,
                 gains_f, base_crowds.astype(np.float64), pemp_f, base_alphas.astype(np.float64),
-                V_far_avg, stop_t=match_idx, start_t=split_t
+                V_far_avg, stop_t=match_idx, start_t=split_t,
+                store_q_count=horizon_effectif,   # Q par-action stockées pour la forward pass
+                store_floor=True,                 # + plancher 'WR outcome' (sans bonus agent)
             )
+            # Plancher rangé en float16 (affichage : précision suffisante, RAM /2 ; numba ne
+            # sait pas écrire de f16 en njit -> cast côté Python). eval_exact_market_forward
+            # ré-upcaste la tranche du match en f32 pour le tensordot (BLAS).
+            Q_near_floor = Q_near_floor.astype(np.float16)
+            sc_fwd = (sc_o, sc_p, sc_cc, sc_b, sc_n)
         else:
             V_near, _ = solve_dp_coarse(
                 base_true_probas=base_true_probas,
@@ -276,7 +289,7 @@ def run_daily_pipeline(
             v_alphas = compute_alphas_isolement(v_true_probas, v_crowds, gains_1N2, seuil_isolement=seuil_isolement)
             if exact_multi:
                 sc_o, sc_p, sc_cc, sc_b, sc_n = _build_sc(v_true_probas)
-                V_near_s = solve_dp_coarse_exact(
+                V_near_s, _, _ = solve_dp_coarse_exact(
                     sc_o, sc_p, sc_cc, sc_b, sc_n,
                     gains_f, v_crowds.astype(np.float64), pemp_f, v_alphas.astype(np.float64),
                     V_next_base_coarse, stop_t=match_idx, start_t=n_matches
@@ -337,23 +350,59 @@ def run_daily_pipeline(
     # --- Mode MULTI-MATCHS (scores exacts sur la nuit) ---
     if exact_multi:
         night_markets = OrderedDict()
+        # PASSE FORWARD : distribution d'occupation des états (coarse 501², couches
+        # booster), propagée à travers la nuit en suivant la politique optimale. Permet,
+        # pour chaque match k>=1, un WR MOYEN par score pondéré par la proba d'atteindre
+        # chaque état. Le match courant (k=0) garde l'éval fine EXACTE au gap réel.
+        do_forward = Q_near is not None and sc_fwd is not None
+        if do_forward:
+            sc_o, sc_p, sc_cc, sc_b, sc_n = sc_fwd
+            g1c, g2c = g1_idx // 2, g2_idx // 2   # fine -> coarse (offset 600 -> 300)
+            P = np.zeros((501, 501, 2), dtype=np.float64)
+            P[min(g1c, g2c), max(g1c, g2c), has_booster] = 1.0  # convention g1<=g2
+
+        for k in range(horizon_effectif):
+            idx = match_idx + k
+            if idx in markets_by_idx:
+                if k == 0 or not do_forward:
+                    reco_m, wr_m, df_m = eval_exact_market(
+                        markets_by_idx[idx], g1_idx, g2_idx, has_booster,
+                        gains_1N2[idx], base_crowds[idx], p_empirique_1D[idx],
+                        base_alphas[idx], V_nexts_avg_fine[k], noms_choix
+                    )
+                else:
+                    reco_m, wr_m, df_m = eval_exact_market_forward(
+                        markets_by_idx[idx], P, Q_near[k], has_booster,
+                        gains_1N2[idx], noms_choix, Q_floor=Q_near_floor[k]
+                    )
+                night_markets[idx + 1] = (reco_m, wr_m, df_m)
+
+            # Avance la distribution à travers le match idx (politique optimale) -> k+1
+            if do_forward and (k + 1) < horizon_effectif:
+                P = forward_propagate_exact(
+                    P, sc_o[idx], sc_p[idx], sc_cc[idx], sc_b[idx], int(sc_n[idx]),
+                    gains_f[idx], base_crowds[idx].astype(np.float64),
+                    pemp_f[idx], float(base_alphas[idx]), Q_near[k]
+                )
+                # Garde-fou : si un histogramme peloton est dégénéré (somme < 1 — typique
+                # d'un p_empirique_1D.npy périmé généré avec des issues figées), la masse
+                # fuit. On renormalise pour que P reste une vraie distribution (no-op sur
+                # données saines). NB : pour des projections fiables, régénérer le .npy.
+                p_sum = P.sum()
+                if p_sum > 0.0:
+                    P /= p_sum
+
+        # Marchés renseignés au-delà de l'horizon de nuit -> warn (comportement historique)
         for idx in sorted(markets_by_idx):
-            k = idx - match_idx
-            if k >= horizon_effectif:
+            if (idx - match_idx) >= horizon_effectif:
                 import warnings
                 warnings.warn(
-                    f"Match id={idx + 1} hors horizon (k={k} >= horizon_nuit "
+                    f"Match id={idx + 1} hors horizon (k={idx - match_idx} >= horizon_nuit "
                     f"effectif={horizon_effectif}) : reco score-exact ignorée. "
                     f"Augmenter horizon_nuit pour le couvrir.",
                     stacklevel=2,
                 )
-                continue
-            reco_m, wr_m, df_m = eval_exact_market(
-                markets_by_idx[idx], g1_idx, g2_idx, has_booster,
-                gains_1N2[idx], base_crowds[idx], p_empirique_1D[idx],
-                base_alphas[idx], V_nexts_avg_fine[k], noms_choix
-            )
-            night_markets[idx + 1] = (reco_m, wr_m, df_m)
+
         reco, best_wr, market_df = night_markets[match_id_cible]
         return reco, best_wr, market_df, Q_table_jour, night_markets
 
@@ -449,6 +498,93 @@ def eval_exact_market(market, g1_idx, g2_idx, has_booster,
     return reco, best_wr, market_df
 
 
+def eval_exact_market_forward(market, P, Q_m, has_booster, gains_match, noms_choix,
+                              Q_floor=None):
+    """
+    WR MOYEN de chaque score à un match FUTUR de la nuit, pondéré par la distribution
+    d'états ATTEIGNABLE (passe forward) :  E[WR(s)] = Σ_état P(état) · Q_m(état, s).
+
+    P (501,501,2) : distribution d'occupation coarse (couche 0 = booster déjà utilisé,
+    couche 1 = booster en main), produite par forward_propagate_exact. Q_m (501,501,
+    Kmax,3) = valeurs par-action [base, keep, use] stockées par solve_dp_coarse_exact.
+
+    Combinaison booster (par score s) :
+      - base : WR sans tenir compte du booster (Σ sur toute la masse) ;
+      - keep : on NE pose PAS le x2 ici -> Q keep sur la masse 'booster en main',
+               Q base sur la masse 'déjà utilisé' ;
+      - x2   : on pose le x2 ici si on l'a encore -> Q use sur la masse 'en main',
+               Q base sinon.
+
+    `Q_floor` (optionnel, même shape que Q_m, typiquement float16) : valeurs par-action
+    du PLANCHER « WR si l'agent loupe son score exact » (Q_store_floor de
+    solve_dp_coarse_exact). Si fourni, ajoute la colonne 'WR outcome (%)' (même
+    construction booster que les WR principaux, max keep/use si booster) — pendant
+    forward de la colonne du match du jour. La tranche est upcastée en f32 pour le
+    tensordot (BLAS). Si None, la colonne est omise (rétro-compat).
+
+    Renvoie (reco, best_wr, market_df), même schéma que eval_exact_market (la colonne
+    'WR outcome' n'est présente que si Q_floor est fourni).
+    """
+    K = len(market.scores)
+    Qk = Q_m[:, :, :K, :]                                   # (501,501,K,3)
+    P0 = P[:, :, 0]
+    P1 = P[:, :, 1]
+
+    base_b0 = np.tensordot(P0, Qk[:, :, :, 0], axes=([0, 1], [0, 1]))  # masse booster utilisé
+    base_b1 = np.tensordot(P1, Qk[:, :, :, 0], axes=([0, 1], [0, 1]))  # masse en main, base
+    keep_b1 = np.tensordot(P1, Qk[:, :, :, 1], axes=([0, 1], [0, 1]))
+    use_b1 = np.tensordot(P1, Qk[:, :, :, 2], axes=([0, 1], [0, 1]))
+
+    wr_base = base_b0 + base_b1
+    wr_keep = base_b0 + keep_b1
+    wr_use = base_b0 + use_b1
+
+    if has_booster:
+        keep_idx = int(np.argmax(wr_keep))
+        use_idx = int(np.argmax(wr_use))
+        if wr_use[use_idx] > wr_keep[keep_idx]:
+            best_idx, best_wr = use_idx, float(wr_use[use_idx])
+            reco = f"{market.scores[best_idx]} + x2"
+        else:
+            best_idx, best_wr = keep_idx, float(wr_keep[keep_idx])
+            reco = f"{market.scores[best_idx]} (Safe)"
+    else:
+        best_idx = int(np.argmax(wr_base))
+        best_wr = float(wr_base[best_idx])
+        reco = f"{market.scores[best_idx]}"
+
+    market_df = pd.DataFrame({
+        "Score": market.scores,
+        "Outcome": [noms_choix[o] for o in market.outcomes],
+        "True Proba (%)": market.p_score * 100.0,
+        "Crowd cond. (%)": market.cond_crowd * 100.0,
+        "Bonus": market.bonus,
+        "E[pts MPP]": expected_mpp_points(market, gains_match),
+        "E[pts 1/2/3]": expected_simple_points(market),
+        "WR base (%)": wr_base * 100.0,
+        "WR keep (%)": wr_keep * 100.0,
+        "WR x2 (%)": wr_use * 100.0,
+    })
+
+    # Plancher 'WR outcome' (agent sans bonus de score), même combinaison booster que
+    # ci-dessus (base sur la masse booster utilisé, keep/use sur la masse en main).
+    if Q_floor is not None:
+        Qf = Q_floor[:, :, :K, :].astype(np.float32)        # upcast f16 -> f32 (BLAS)
+        f_b0 = np.tensordot(P0, Qf[:, :, :, 0], axes=([0, 1], [0, 1]))
+        f_b1 = np.tensordot(P1, Qf[:, :, :, 0], axes=([0, 1], [0, 1]))
+        f_keep1 = np.tensordot(P1, Qf[:, :, :, 1], axes=([0, 1], [0, 1]))
+        f_use1 = np.tensordot(P1, Qf[:, :, :, 2], axes=([0, 1], [0, 1]))
+        floor_keep = f_b0 + f_keep1
+        floor_use = f_b0 + f_use1
+        if has_booster:
+            wr_outcome = np.maximum(floor_keep, floor_use)
+        else:
+            wr_outcome = f_b0 + f_b1
+        market_df["WR outcome (%)"] = wr_outcome * 100.0
+
+    return reco, best_wr, market_df
+
+
 def _recommend_exact_score(exact_score_data, g1_idx, g2_idx, has_booster,
                            gains_match, crowd_match, p_empirique_match, alpha_match,
                            V_next, noms_choix, Q_table_jour, outcome_probas=None):
@@ -456,7 +592,8 @@ def _recommend_exact_score(exact_score_data, g1_idx, g2_idx, has_booster,
     Mode mono-match : construit le marché (ancré sur le 1N2 via outcome_probas) et
     renvoie (reco, best_wr, market_df, Q_table_jour).
     """
-    market = build_exact_score_market(exact_score_data, outcome_probas=outcome_probas, shape_correction=True)
+    market = build_exact_score_market(exact_score_data, outcome_probas=outcome_probas,
+                                      shape_correction=True, mpp_outcome_crowd=crowd_match)
     reco, best_wr, market_df = eval_exact_market(
         market, g1_idx, g2_idx, has_booster,
         gains_match, crowd_match, p_empirique_match, alpha_match, V_next, noms_choix

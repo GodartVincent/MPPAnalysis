@@ -9,8 +9,8 @@ import numpy as np
 import shin
 import unicodedata
 from collections import namedtuple
-from scipy.stats import binom
-from scipy.optimize import root_scalar
+from scipy.stats import binom, poisson
+from scipy.optimize import root_scalar, minimize
 from typing import Tuple
 
 # --- CONSTANTES DU MODÈLE MPP (À mettre à jour avec les résultats du Notebook 12_) ---
@@ -31,14 +31,26 @@ MAX_MPP_GAIN = 225.0  # Gain MPP maximum réaliste (allemagne - curacao : 222.0)
 MIN_TRUE_PROBA = 0.02  # Probabilité minimale réaliste d'une issue (allemagne - curacao : 0.02)
 MAX_TRUE_PROBA = 0.95  # Probabilité maximale réaliste d'une issue (allemagne - curacao : 0.95)
 
-# --- CORRECTION DE FORME DU CROWD SCORE EXACT (calibré au Notebook 25_, §4) ---
-# Le crowd Winamax conditionnel (normalisé par outcome) approxime mal le crowd MPP :
-# il SUR-pondère le score 0-0 (les parieurs casual MPP le boudent au profit de 1-1, 2-1…).
-# Modèle : cc_mpp(s) ∝ cc_wmx(s)^gamma · exp(delta · 1[s == 0-0]), renormalisé PAR OUTCOME.
-# gamma≈1 (Winamax bien calibré en ÉCHELLE -> une simple température n'aide pas), seul le
-# 0-0 est biaisé. LOO par match : ~61 % -> ~75 % d'exactitude de catégorie de bonus.
-EXACT_SCORE_SHAPE_GAMMA = 1.0          # température sur le crowd (1.0 = échelle inchangée)
-EXACT_SCORE_ZERO_ZERO_LOG_PENALTY = -1.645  # log-pénalité du 0-0 (exp(-1.645) ≈ 19 %)
+# --- CORRECTION DU CROWD SCORE EXACT Winamax -> MPP (calibré au Notebook 25_) ---
+# Le crowd Winamax conditionnel approxime mal le crowd MPP. Modèle retenu (NB25), un
+# BLEND JOINT d'une surface Winamax et d'une surface génératrice ANCRÉE sur le crowd
+# MPP 1N2, plus une pénalité sur le 0-0 (sur-pondéré par Winamax) :
+#   cc_mpp(s) ∝ [ a·crowd_wmx(s) + (1-a)·surf_MPP(s) ] · exp(delta·1[s==0-0])
+# où surf_MPP = Poisson(i;λ1)·Poisson(j;λ2) avec (λ1,λ2) ajustés pour que les masses
+# des 3 régions (1/N/2) de la surface égalent le crowd MPP 1N2 (meilleure info de
+# véracité disponible). Le blend est au niveau JOINT (composantes normalisées
+# globalement) PUIS renormalisé PAR OUTCOME -> respecte le 1N2 comme contrainte dure
+# et reshape la conditionnelle intra-outcome (le crowd MPP 1N2 déplace le centre de la
+# surface -> capte le glissement de marge des matchs déséquilibrés).
+# LOO par match : exact ~70 %, ±1cat 94 %, |err| points de bonus 6.6 (vs 8.4 sans
+# correction, -21 %). Répare la famille « issue peu jouée -> petite marge » + les
+# scores à crowd Winamax NUL (injection de masse). Si le crowd MPP 1N2 n'est pas fourni,
+# on retombe sur la SEULE pénalité 0-0 sur le crowd Winamax conditionnel (rétro-compat).
+# LIMITE connue : blowout extrême (gros favori) -> tendance à SUR-estimer le nombre de
+# buts (le Poisson confond P(victoire) élevée et beaucoup de buts) ; cf. NB25 m31 (3-0).
+EXACT_SCORE_BLEND_WMX = 0.90           # poids du crowd Winamax dans le blend (1-a sur la surface)
+EXACT_SCORE_ZERO_ZERO_LOG_PENALTY = -1.8  # log-pénalité du 0-0 (exp(-1.8) ≈ 17 %)
+EXACT_SCORE_GOAL_GRID = 10             # buts max par équipe pour la surface Poisson
 
 def calculate_win_probability(min_successes: int, num_matches: int, success_prob: float) -> float:
     """
@@ -782,48 +794,121 @@ ExactScoreMarket = namedtuple(
 )
 
 
-def correct_cond_crowd(cond_crowd, scores, outcomes,
-                       gamma=EXACT_SCORE_SHAPE_GAMMA,
-                       delta00=EXACT_SCORE_ZERO_ZERO_LOG_PENALTY):
+def _fit_poisson_lambdas(mpp_outcome_crowd, goal_grid=EXACT_SCORE_GOAL_GRID):
     """
-    Corrige le crowd conditionnel Winamax (déjà normalisé PAR OUTCOME) vers une
-    estimation du crowd conditionnel MPP, via le modèle calibré au Notebook 25_ (§4) :
-
-        cc_mpp(s) ∝ cc_wmx(s)**gamma · exp(delta00 · 1[s == "0-0"])
-
-    renormalisé PAR OUTCOME. Les scores à crowd nul (cc_wmx == 0) restent nuls :
-    le 0-0 d'un blowout que MPP joue mais pas Winamax (ex. 1-1) est inatteignable
-    depuis le seul crowd Winamax (limite connue, cf. NB25).
-
-    Avec `gamma == 1` (défaut), la correction est un NO-OP pour tout outcome ne
-    contenant pas de 0-0 (et pour un 0-0 seul dans son outcome) : seul un outcome
-    nul listant le 0-0 ET au moins un autre nul (1-1, 2-2…) est modifié — le 0-0
-    y est dévalué (exp(delta00) < 1) et la masse redistribuée aux autres nuls.
-
-    Renvoie un nouveau tableau (K,) de crowd conditionnel corrigé.
+    Ajuste (λ1, λ2) de deux Poisson indépendants (buts dom / ext) pour que les masses
+    des 3 régions de la grille de scores — victoire dom (i>j), nul (i=j), victoire ext
+    (i<j) — collent au crowd MPP 1N2 `mpp_outcome_crowd` = [q1, qN, q2]. On matche q1
+    (P(i>j)) et q2 (P(i<j)) ; le nul suit. Grille grossière + raffinement local
+    (déterministe). Renvoie (λ1, λ2).
     """
-    cc = np.asarray(cond_crowd, dtype=float)
+    q = np.asarray(mpp_outcome_crowd, dtype=float)
+    q = q / q.sum()
+    gi = np.arange(goal_grid + 1)
+
+    def regions(l1, l2):
+        J = np.outer(poisson.pmf(gi, max(l1, 1e-6)), poisson.pmf(gi, max(l2, 1e-6)))
+        return float(np.tril(J, -1).sum()), float(np.triu(J, 1).sum())  # (win_dom, win_ext)
+
+    def err(x):
+        w, lo = regions(x[0], x[1])
+        return (w - q[0]) ** 2 + (lo - q[2]) ** 2
+
+    best, bl = None, (1.0, 1.0)
+    for l1 in np.linspace(0.1, 5.0, 50):
+        for l2 in np.linspace(0.05, 3.0, 40):
+            e = err((l1, l2))
+            if best is None or e < best:
+                best, bl = e, (l1, l2)
+    # Raffinement local (Nelder-Mead borné, départ = meilleur point de grille)
+    res = minimize(err, np.array(bl), method="Nelder-Mead",
+                   options=dict(xatol=1e-3, fatol=1e-8, maxiter=400))
+    l1, l2 = res.x if res.success or err(res.x) < best else bl
+    return max(l1, 1e-6), max(l2, 1e-6)
+
+
+def correct_cond_crowd(crowds_raw, scores, outcomes, mpp_outcome_crowd=None,
+                       delta00=EXACT_SCORE_ZERO_ZERO_LOG_PENALTY,
+                       blend_wmx=EXACT_SCORE_BLEND_WMX,
+                       goal_grid=EXACT_SCORE_GOAL_GRID):
+    """
+    Corrige le crowd des scores exacts Winamax vers une estimation du crowd
+    conditionnel MPP (modèle calibré au Notebook 25_). Renvoie le crowd CONDITIONNEL
+    corrigé (normalisé PAR OUTCOME), de même forme que `crowds_raw`.
+
+    `crowds_raw` : crowd Winamax BRUT par score (non normalisé ; 0 admis).
+    `scores`     : liste des scores "b1-b2" alignée.
+    `outcomes`   : issue 1N2 (0/1/2) de chaque score.
+    `mpp_outcome_crowd` : crowd MPP 1N2 du match [q1, qN, q2] (= la 1N2 du CSV principal).
+
+    DEUX RÉGIMES :
+      - `mpp_outcome_crowd` fourni (chemin nominal du pipeline) : BLEND JOINT
+            cc(s) ∝ [ a·wmx_glob(s) + (1-a)·surf_glob(s) ] · exp(delta00·1[0-0])
+        renormalisé par outcome, où `wmx_glob` = crowd Winamax normalisé GLOBALEMENT,
+        `surf_glob` = surface Poisson(λ1,λ2) (ajustée sur le crowd MPP 1N2 via
+        `_fit_poisson_lambdas`) normalisée globalement, `a` = `blend_wmx`. La surface
+        INJECTE de la masse là où le crowd Winamax est nul (scores plausibles à 0 %).
+      - `mpp_outcome_crowd` None (rétro-compat / tests sans 1N2) : SEULE la pénalité
+        0-0 est appliquée sur le crowd Winamax conditionnel (le 0-0 d'un outcome nul
+        multi-scores est dévalué de exp(delta00) ; no-op sinon ; crowd nul reste nul).
+
+    Le bonus de score exact et la proba de bonus de Bob/peloton (DP) consomment ce
+    crowd corrigé. LIMITE : blowout extrême -> sur-estimation du nombre de buts (NB25).
+    """
+    cr = np.asarray(crowds_raw, dtype=float)
     outc = np.asarray(outcomes)
     is00 = np.array([
         1.0 if str(s).strip() in ("0-0", "0 - 0") else 0.0 for s in scores
     ], dtype=float)
 
-    out = cc.copy()
+    # Crowd Winamax CONDITIONNEL (normalisé par outcome) — composante / base du fallback.
+    wmx_cond = np.zeros_like(cr)
     for o in np.unique(outc):
         mask = outc == o
-        # Rien à corriger si l'outcome ne liste pas de 0-0 et gamma==1 (no-op exact).
-        if gamma == 1.0 and not is00[mask].any():
-            continue
-        w = np.where(cc[mask] > 0.0, cc[mask] ** gamma * np.exp(delta00 * is00[mask]), 0.0)
-        tot = w.sum()
+        tot = cr[mask].sum()
         if tot > 0.0:
-            out[mask] = w / tot
-        # tot == 0 (aucun crowd non nul dans l'outcome) -> on garde l'original.
+            wmx_cond[mask] = cr[mask] / tot
+
+    # --- Régime rétro-compat : pénalité 0-0 seule sur le conditionnel Winamax ---
+    if mpp_outcome_crowd is None:
+        out = wmx_cond.copy()
+        for o in np.unique(outc):
+            mask = outc == o
+            if not is00[mask].any():
+                continue  # no-op : pas de 0-0 dans cet outcome
+            w = np.where(wmx_cond[mask] > 0.0,
+                         wmx_cond[mask] * np.exp(delta00 * is00[mask]), 0.0)
+            tot = w.sum()
+            if tot > 0.0:
+                out[mask] = w / tot
+        return out
+
+    # --- Régime nominal : BLEND JOINT (Winamax + surface Poisson ancrée 1N2 MPP) ---
+    l1, l2 = _fit_poisson_lambdas(mpp_outcome_crowd, goal_grid)
+    ij = np.array([[int(x) for x in str(s).split("-")] for s in scores])
+    gp1 = poisson.pmf(np.minimum(ij[:, 0], goal_grid), l1)
+    gp2 = poisson.pmf(np.minimum(ij[:, 1], goal_grid), l2)
+    surf = gp1 * gp2
+
+    # Composantes normalisées GLOBALEMENT (-> masses de région signifiantes), blend joint.
+    wmx_glob = cr / cr.sum() if cr.sum() > 0.0 else np.zeros_like(cr)
+    surf_glob = surf / surf.sum() if surf.sum() > 0.0 else surf
+    a = blend_wmx if cr.sum() > 0.0 else 0.0   # pas de crowd Winamax -> surface seule
+    blended = a * wmx_glob + (1.0 - a) * surf_glob
+    blended = blended * np.exp(delta00 * is00)
+
+    out = np.zeros_like(cr)
+    for o in np.unique(outc):
+        mask = outc == o
+        tot = blended[mask].sum()
+        if tot > 0.0:
+            out[mask] = blended[mask] / tot
     return out
 
 
 def build_exact_score_market(exact_score_data, outcome_probas=None,
-                             outcome_tol=0.08, shape_correction=True) -> ExactScoreMarket:
+                             outcome_tol=0.08, shape_correction=True,
+                             mpp_outcome_crowd=None) -> ExactScoreMarket:
     """
     Construit le marché des scores exacts à partir d'un dict
     `{ "b1-b2": (cote, crowd_pct), ... }`. Les slots à cote absente
@@ -851,11 +936,14 @@ def build_exact_score_market(exact_score_data, outcome_probas=None,
       le vecteur global à 1 (outright partiel : masse des scores non listés repliée
       sur les listés).
 
-    CORRECTION DE FORME (`shape_correction`, défaut True) : le crowd conditionnel
-    Winamax est corrigé du biais 0-0 via `correct_cond_crowd` (modèle calibré NB25 §4)
-    AVANT le calcul du bonus. Le `cond_crowd` renvoyé est donc déjà corrigé (et alimente
-    aussi la proba de bonus de Bob/peloton dans la DP). Mettre False pour récupérer le
-    crowd Winamax brut (cc_wmx) sans correction.
+    CORRECTION DU CROWD (`shape_correction`, défaut True) : le crowd Winamax est corrigé
+    vers le crowd MPP via `correct_cond_crowd` (modèle NB25) AVANT le barème. Le `cond_crowd`
+    renvoyé est donc déjà corrigé (et alimente aussi la proba de bonus de Bob/peloton dans la
+    DP). Si `mpp_outcome_crowd` (= 1N2 MPP du match, ex. `base_crowds[match_idx]`) est fourni,
+    la correction applique le BLEND JOINT Winamax + surface Poisson ancrée sur ce 1N2 (capte
+    le glissement de marge des matchs déséquilibrés + injecte de la masse sur les scores à
+    crowd Winamax nul) ; sinon, repli sur la seule pénalité 0-0. Mettre `shape_correction=False`
+    pour récupérer le crowd Winamax brut conditionnel (cc_wmx) sans aucune correction.
     """
     scores, odds, crowds, outcomes = [], [], [], []
     for score, data in exact_score_data.items():
@@ -912,7 +1000,8 @@ def build_exact_score_market(exact_score_data, outcome_probas=None,
     if total > 0.0:
         p_score = p_score / total
 
-    # Crowd conditionnel : normalisation PAR OUTCOME
+    # Crowd conditionnel : normalisation PAR OUTCOME (utilisée telle quelle si
+    # shape_correction=False ; sinon recalculée par correct_cond_crowd à partir du brut).
     cond_crowd = np.zeros_like(crowds)
     for o in (0, 1, 2):
         mask = outcomes == o
@@ -920,11 +1009,14 @@ def build_exact_score_market(exact_score_data, outcome_probas=None,
         if tot > 0.0:
             cond_crowd[mask] = crowds[mask] / tot
 
-    # Correction de FORME (NB25 §4) : le crowd Winamax sur-pondère le 0-0 vs MPP.
-    # Appliquée AVANT le barème -> le cc corrigé pilote le bonus ET sert ensuite de
-    # proba de bonus de Bob/peloton dans la DP (evaluate_exact_score_day).
+    # Correction du crowd Winamax -> MPP (NB25), AVANT le barème -> le cc corrigé pilote le
+    # bonus ET sert de proba de bonus de Bob/peloton dans la DP (evaluate_exact_score_day).
+    # Si `mpp_outcome_crowd` (1N2 MPP du match) est fourni : blend joint Winamax + surface
+    # Poisson ancrée 1N2 ; sinon repli sur la seule pénalité 0-0. On passe le crowd BRUT
+    # (correct_cond_crowd gère les normalisations par-outcome et globale).
     if shape_correction:
-        cond_crowd = correct_cond_crowd(cond_crowd, scores, outcomes)
+        cond_crowd = correct_cond_crowd(crowds, scores, outcomes,
+                                        mpp_outcome_crowd=mpp_outcome_crowd)
 
     bonus = np.asarray([exact_score_bonus(cc) for cc in cond_crowd], dtype=np.int64)
 
