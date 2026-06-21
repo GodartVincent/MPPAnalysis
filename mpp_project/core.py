@@ -1074,6 +1074,132 @@ def expected_mpp_points(market: ExactScoreMarket, gains_1N2) -> np.ndarray:
     return E_gain + p * bonus
 
 
+# ==========================================================================
+# MODÈLE CHEAP DE BONUS DE SCORE EXACT POUR L'HORIZON (dé-biais du booster x2)
+# ==========================================================================
+# La DP lointaine ne simule que le 1N2 (bonus 0), alors que la DP proche modélise le
+# vrai bonus de score exact des matchs renseignés. Du coup les matchs futurs ont une
+# E[points] sous-estimée -> la valeur de GARDER le x2 pour plus tard est sous-estimée
+# -> la DP sur-recommande de poser le x2 sur le match courant exact-aware. On corrige
+# en injectant dans l'horizon un bonus SYNTHÉTIQUE par issue, calibré sur les marchés
+# réellement renseignés (cf. solve_dp_coarse_hbonus). Modèle HYBRIDE : l'agent décroche
+# le bonus de façon STOCHASTIQUE (la queue +50/+100 compte, le x2 la double) ; Bob et le
+# peloton le touchent en MOYENNE (déterministe, moins cher, leur variance pèse peu).
+
+# active        : bool — False si aucune donnée (horizon = 1N2 pur).
+# draw          : (q_agent, B_agent, mean_opp) pour les nuls (issue 1).
+# dec_thresholds: (2,) seuils de P(o) séparant outsider / médian / favori fort.
+# dec_bins      : tuple de 3 (q_agent, B_agent, mean_opp) pour les issues décisives (0/2).
+HorizonBonusModel = namedtuple(
+    "HorizonBonusModel", ["active", "draw", "dec_thresholds", "dec_bins"]
+)
+
+
+def calibrate_horizon_bonus_model(exact_scores_by_match, base_true_probas,
+                                  base_crowds=None, dec_thresholds=(0.35, 0.55)):
+    """
+    Calibre un HorizonBonusModel à partir des marchés de scores exacts renseignés.
+
+    Pour chaque issue o d'un match renseigné (marché ancré sur le 1N2 du CSV) :
+      - q_agent  = proba conditionnelle du MEILLEUR score de o (l'agent parie le score
+                   modal -> taux où il décroche le bonus quand o sort) ; B_agent = son bonus ;
+      - mean_opp = E[bonus | o sort, bon outcome] = Σ_s cond(s|o)·cc(s)·bonus(s)
+                   (Bob/peloton, atténué par le crowd conditionnel cc < 1).
+    Les échantillons sont moyennés par classe : un bucket NUL (o==1, dominé par 0-0/1-1),
+    et 3 buckets DÉCISIFS (o∈{0,2}) selon la force du favori P(o) (seuils dec_thresholds).
+    Buckets vides -> repli sur la moyenne décisive globale, puis globale toutes issues.
+
+    `base_true_probas` (n,3) : 1N2 du CSV (ancrage + alignement des index de match).
+    `base_crowds` (n,3, optionnel) : 1N2 MPP du CSV -> passé en `mpp_outcome_crowd` à
+    `build_exact_score_market` pour que les bonus calibrés correspondent EXACTEMENT aux
+    marchés que la DP consomme (blend joint NB25). None -> repli pénalité 0-0 seule.
+    Renvoie active=False si aucun échantillon exploitable (horizon laissé en 1N2 pur).
+    """
+    thr = np.asarray(dec_thresholds, dtype=float)
+    draw_samples = []
+    dec_samples = [[], [], []]
+    all_samples = []
+
+    for mid, data in exact_scores_by_match.items():
+        idx = int(mid) - 1
+        if idx < 0 or idx >= len(base_true_probas):
+            continue
+        try:
+            m = build_exact_score_market(
+                data, outcome_probas=base_true_probas[idx], shape_correction=True,
+                mpp_outcome_crowd=None if base_crowds is None else base_crowds[idx],
+            )
+        except ValueError:
+            continue
+        outc = np.asarray(m.outcomes)
+        p = np.asarray(m.p_score, dtype=float)
+        cc = np.asarray(m.cond_crowd, dtype=float)
+        bonus = np.asarray(m.bonus, dtype=float)
+        for o in (0, 1, 2):
+            mask = outc == o
+            if not mask.any():
+                continue
+            P_o = float(p[mask].sum())
+            if P_o <= 0.0:
+                continue
+            cond = p[mask] / P_o
+            j = int(np.argmax(cond))
+            sample = (
+                float(cond[j]),                                  # q_agent
+                float(bonus[mask][j]),                           # B_agent
+                float(np.sum(cond * cc[mask] * bonus[mask])),    # mean_opp
+            )
+            all_samples.append(sample)
+            if o == 1:
+                draw_samples.append(sample)
+            else:
+                dec_samples[int(np.digitize(P_o, thr))].append(sample)
+
+    if not all_samples:
+        zero = (0.0, 0.0, 0.0)
+        return HorizonBonusModel(False, zero, thr, (zero, zero, zero))
+
+    def _mean(samples, fallback):
+        if not samples:
+            return fallback
+        return tuple(np.asarray(samples, dtype=float).mean(axis=0))
+
+    glob = _mean(all_samples, (0.0, 0.0, 0.0))
+    dec_glob = _mean([s for b in dec_samples for s in b], glob)
+    draw = _mean(draw_samples, glob)
+    dec_bins = tuple(_mean(dec_samples[b], dec_glob) for b in range(3))
+    return HorizonBonusModel(True, draw, thr, dec_bins)
+
+
+def build_horizon_bonus_arrays(true_probas, model: HorizonBonusModel):
+    """
+    Construit les tableaux (n,3) à injecter dans solve_dp_coarse_hbonus à partir d'un
+    HorizonBonusModel et d'une matrice de probas 1N2 (n,3) :
+      q_agent  : proba que l'agent décroche le bonus s'il parie cette issue et qu'elle sort ;
+      B_agent  : bonus agent associé (points PLEINS) ;
+      mean_opp : E[bonus adverse | issue, bon outcome] (points PLEINS, Bob/peloton).
+    Issue nulle -> bucket draw ; issue décisive -> bucket selon P(o) (seuils du modèle).
+    `model.active == False` -> tableaux de zéros (horizon 1N2 pur, no-op dans la DP).
+    """
+    n = len(true_probas)
+    q_agent = np.zeros((n, 3), dtype=np.float64)
+    B_agent = np.zeros((n, 3), dtype=np.float64)
+    mean_opp = np.zeros((n, 3), dtype=np.float64)
+    if not model.active:
+        return q_agent, B_agent, mean_opp
+    thr = np.asarray(model.dec_thresholds, dtype=float)
+    for t in range(n):
+        for o in (0, 1, 2):
+            if o == 1:
+                q, B, mo = model.draw
+            else:
+                q, B, mo = model.dec_bins[int(np.digitize(true_probas[t, o], thr))]
+            q_agent[t, o] = q
+            B_agent[t, o] = B
+            mean_opp[t, o] = mo
+    return q_agent, B_agent, mean_opp
+
+
 def load_exact_scores(csv_path, match_id) -> dict:
     """
     Charge les scores exacts d'un match depuis un CSV (colonnes `match_id, score,

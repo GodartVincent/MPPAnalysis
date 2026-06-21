@@ -26,10 +26,14 @@ from mpp_project.core import (
     load_exact_scores,
     EXACT_SCORE_ZERO_ZERO_LOG_PENALTY,
 )
-from mpp_project.core import load_exact_scores_by_match
+from mpp_project.core import (
+    load_exact_scores_by_match,
+    calibrate_horizon_bonus_model,
+    build_horizon_bonus_arrays,
+)
 from mpp_project.oracle_dp import (
     evaluate_exact_score_day, solve_dp_coarse, solve_dp_coarse_exact,
-    forward_propagate_exact,
+    solve_dp_coarse_hbonus, forward_propagate_exact,
     GAP_OFFSET, GAP_MIN, GAP_MAX,
 )
 from mpp_project.daily_pipeline import run_daily_pipeline, eval_exact_market_forward
@@ -573,6 +577,72 @@ def test_coarse_exact_floor_store():
         stop_t=0, start_t=-1, store_q_count=n, store_floor=True)
     assert (Q_floor2 <= Q_store2 + 1e-5).all(), "plancher doit rester <= Q_store"
     assert (Q_floor2 < Q_store2 - 1e-6).any(), "le bonus agent doit faire baisser le plancher"
+
+
+# ===========================================================================
+# 3bis. BONUS HORIZON HYBRIDE (dé-biais du booster x2)
+# ===========================================================================
+def test_calibrate_horizon_bonus_model():
+    """Calibration depuis des marchés renseignés : modèle actif, paramètres sains,
+    et tableaux (n,3) cohérents (bucket nul vs décisifs)."""
+    data = {
+        1: {"1-0": (3.0, 30.0), "2-1": (7.0, 15.0), "0-0": (8.0, 12.0),
+            "1-1": (9.0, 8.0), "0-1": (7.5, 10.0)},
+        2: {"1-0": (4.0, 25.0), "0-0": (6.0, 20.0), "0-1": (5.0, 22.0)},
+    }
+    base = np.array([[0.55, 0.25, 0.20], [0.35, 0.30, 0.35]])
+    crowds = np.array([[0.55, 0.25, 0.20], [0.40, 0.25, 0.35]])
+
+    model = calibrate_horizon_bonus_model(data, base, base_crowds=crowds)
+    assert model.active
+    q, B, opp = build_horizon_bonus_arrays(base, model)
+    assert q.shape == B.shape == opp.shape == (2, 3)
+    assert ((q >= 0.0) & (q <= 1.0)).all()
+    assert (B >= 0.0).all()
+    assert (opp >= 0.0).all()
+    # Modèle inactif (aucune donnée) -> tableaux nuls.
+    empty = calibrate_horizon_bonus_model({}, base, base_crowds=crowds)
+    assert not empty.active
+    qz, Bz, oz = build_horizon_bonus_arrays(base, empty)
+    assert not qz.any() and not Bz.any() and not oz.any()
+
+
+def _hbonus_scenario(n=3, max_gain=20):
+    tp = np.array([[0.50, 0.30, 0.20]] * n, dtype=np.float64)
+    cr = np.array([[0.45, 0.35, 0.20]] * n, dtype=np.float64)
+    ga = np.array([[40, 30, 50]] * n, dtype=np.int32)
+    hist = np.zeros((n, 3, max_gain), dtype=np.float64)
+    hist[:, :, 0] = 0.5
+    hist[:, :, 6] = 0.5
+    al = np.full(n, 0.3, dtype=np.float64)
+    V0 = np.zeros((501, 501, 2), dtype=np.float32)
+    return tp, cr, ga, hist, al, V0
+
+
+def test_hbonus_zero_equals_coarse():
+    """RÉGRESSION : solve_dp_coarse_hbonus avec bonus nuls == solve_dp_coarse (au bit près)."""
+    n = 3
+    tp, cr, ga, hist, al, V0 = _hbonus_scenario(n)
+    z = np.zeros((n, 3), dtype=np.float64)
+    V_h = solve_dp_coarse_hbonus(tp, cr, ga, hist, al, V0, z, z, z,
+                                 stop_t=0, start_t=-1)
+    V_ref, _ = solve_dp_coarse(tp, cr, ga, hist, al, V0, stop_t=0, horizon_nuit=0, start_t=-1)
+    assert np.array_equal(V_h, V_ref), f"écart max {np.abs(V_h - V_ref).max():.2e}"
+
+
+def test_hbonus_agent_bonus_raises_value():
+    """Bonus agent SEUL (mean_opp=0) : l'agent gagne des points en plus -> WR partout >=
+    baseline (monotonie), et strictement > quelque part."""
+    n = 3
+    tp, cr, ga, hist, al, V0 = _hbonus_scenario(n)
+    z = np.zeros((n, 3), dtype=np.float64)
+    q = np.full((n, 3), 0.10, dtype=np.float64)
+    B = np.full((n, 3), 50.0, dtype=np.float64)
+    V_h = solve_dp_coarse_hbonus(tp, cr, ga, hist, al, V0, q, B, z,
+                                 stop_t=0, start_t=-1)
+    V_ref, _ = solve_dp_coarse(tp, cr, ga, hist, al, V0, stop_t=0, horizon_nuit=0, start_t=-1)
+    assert (V_h >= V_ref - 1e-6).all(), "le bonus agent ne doit pas baisser le WR"
+    assert (V_h > V_ref + 1e-5).any(), "le bonus agent doit relever le WR quelque part"
 
 
 MULTI_DATA = {

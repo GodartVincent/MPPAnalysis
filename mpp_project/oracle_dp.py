@@ -527,6 +527,179 @@ def solve_dp_coarse(base_true_probas, base_crowds, gains_1N2, p_empirique_1D, al
 
 
 # ==========================================================================
+# DP coarse + BONUS HORIZON HYBRIDE (dé-biais du booster x2)
+# ==========================================================================
+@njit(parallel=True)
+def solve_dp_coarse_hbonus(base_true_probas, base_crowds, gains_1N2, p_empirique_1D,
+                           alphas_isolement, V_horizon, q_agent, B_agent, mean_opp,
+                           stop_t=0, start_t=-1):
+    """
+    Variante de solve_dp_coarse (501², demi-points) injectant un MODÈLE CHEAP de bonus de
+    score exact sur l'horizon 1N2, pour que les matchs futurs aient une E[points] réaliste
+    et que la décision du booster x2 du match courant se compare à de vraies alternatives
+    (cf. core.calibrate_horizon_bonus_model). Par match t et issue o, modèle HYBRIDE :
+
+      - AGENT (stochastique) : s'il parie l'issue o et qu'elle sort, il décroche EN PLUS le
+        bonus B_agent[t,o] (points PLEINS) avec proba q_agent[t,o]. 2 sous-branches sur la
+        SEULE action gagnante (a==o) ; le x2 double gain+bonus -> la queue du bonus compte.
+      - BOB / PELOTON (déterministe) : bonus en MOYENNE -> +mean_opp[t,o]/2 (demi-points) sur
+        leur gain quand ils ont le bon outcome (Bob si bob_a==o ; peloton sur les deltas>0).
+
+    Tableaux de bonus (n_matches, 3) en points PLEINS (divisés par 2 en interne). Avec des
+    tableaux de zéros, retombe AU BIT PRÈS sur solve_dp_coarse (testé). Renvoie uniquement
+    V_all_matches (n_matches, 501, 501, 2) — pas de stockage Q (horizon lointain). Conventions
+    start_t IDENTIQUES à solve_dp_coarse (start_t=n_matches pour CHAÎNER un horizon).
+    """
+    n_matches = base_true_probas.shape[0]
+    max_gain = p_empirique_1D.shape[2]
+
+    V_all_matches = np.zeros((n_matches, 501, 501, 2), dtype=np.float32)
+    V_next = np.copy(V_horizon)
+
+    # 1. Condition terminale (run complet uniquement)
+    if start_t < 0:
+        for g1 in range(501):
+            val_g1 = g1 - 300
+            for g2 in range(g1, 501):
+                val_g2 = g2 - 300
+                if val_g1 > 0 and val_g2 > 0: win_prob = 1.0
+                elif (val_g1 == 0 and val_g2 > 0) or (val_g1 > 0 and val_g2 == 0): win_prob = 0.5
+                elif val_g1 == 0 and val_g2 == 0: win_prob = 1.0 / 3.0
+                else: win_prob = 0.0
+                V_next[g1, g2, 0] = win_prob
+                V_next[g1, g2, 1] = win_prob
+
+    if start_t < 0:
+        t_debut = n_matches - 1
+    else:
+        t_debut = start_t - 1
+
+    # 2. Rétro-propagation
+    for t in range(t_debut, stop_t - 1, -1):
+        V_current = np.zeros((501, 501, 2), dtype=np.float32)
+        t_prob = base_true_probas[t]
+        c_rep = base_crowds[t]
+        t_gains = gains_1N2[t]
+        alpha = alphas_isolement[t]
+
+        for g1 in prange(501):
+            val_g1 = g1 - 300
+            for g2 in range(g1, 501):
+                val_g2 = g2 - 300
+
+                best_v_b0 = 0.0
+                best_v_b1 = 0.0
+
+                for a in range(3):
+                    expected_v_b0 = 0.0
+                    expected_v_keep = 0.0
+                    expected_v_use = 0.0
+
+                    for out in range(3):
+                        p_out = t_prob[out]
+                        if p_out == 0.0: continue
+
+                        gh = t_gains[out] / 2.0          # gain demi-points (= a_g si a==out)
+                        full = float(t_gains[out])        # gain plein (= a_g sous booster)
+                        omh = mean_opp[t, out] / 2.0      # bonus adverse moyen (demi)
+                        out_p_empirique = p_empirique_1D[t, out]
+
+                        # Sous-branches AGENT : stochastique uniquement sur l'action gagnante.
+                        if a == out and q_agent[t, out] > 0.0:
+                            n_ab = 2
+                            qh = q_agent[t, out]
+                            Bh = B_agent[t, out] / 2.0
+                        else:
+                            n_ab = 1
+                            qh = 0.0
+                            Bh = 0.0
+
+                        for ab in range(n_ab):
+                            if a == out:
+                                if n_ab == 2 and ab == 0:
+                                    aw = qh
+                                    a_g = gh + Bh
+                                    a_g_boost = full + 2.0 * Bh
+                                elif n_ab == 2:
+                                    aw = 1.0 - qh
+                                    a_g = gh
+                                    a_g_boost = full
+                                else:
+                                    aw = 1.0
+                                    a_g = gh
+                                    a_g_boost = full
+                            else:
+                                aw = 1.0
+                                a_g = 0.0
+                                a_g_boost = 0.0
+                            if aw == 0.0:
+                                continue
+
+                            for bob_a in range(3):
+                                p_bob = c_rep[bob_a]
+                                if p_bob == 0.0: continue
+
+                                bob_g = (gh + omh) if bob_a == out else 0.0
+                                jp_base = p_out * p_bob
+
+                                new_gap_bob_norm  = val_g1 + a_g       - bob_g
+                                new_gap_bob_boost = val_g1 + a_g_boost - bob_g
+
+                                esp_peloton_b0   = 0.0
+                                esp_peloton_keep = 0.0
+                                esp_peloton_use  = 0.0
+
+                                for delta_gain in range(max_gain):
+                                    p_peloton = out_p_empirique[delta_gain]
+                                    if p_peloton == 0.0: continue
+
+                                    # delta>0 = un joueur a marqué (bon outcome) -> éligible
+                                    # au bonus moyen ; delta==0 -> personne ne progresse.
+                                    if delta_gain != 0:
+                                        dg_c = delta_gain / 2.0 + omh
+                                    else:
+                                        dg_c = 0.0
+                                    new_gap_peloton_norm  = val_g2 + a_g       - dg_c
+                                    new_gap_peloton_boost = val_g2 + a_g_boost - dg_c
+
+                                    val_g1_final_norm  = min(new_gap_bob_norm,  new_gap_peloton_norm)
+                                    val_g2_final_norm  = alpha * max(new_gap_bob_norm,  new_gap_peloton_norm) + (1.0 - alpha) * new_gap_peloton_norm
+                                    val_g1_final_boost = min(new_gap_bob_boost, new_gap_peloton_boost)
+                                    val_g2_final_boost = alpha * max(new_gap_bob_boost, new_gap_peloton_boost) + (1.0 - alpha) * new_gap_peloton_boost
+
+                                    g1_norm  = max(0, min(500, int(round(val_g1_final_norm))  + 300))
+                                    g2_norm  = max(0, min(500, int(round(val_g2_final_norm))  + 300))
+                                    g1_boost = max(0, min(500, int(round(val_g1_final_boost)) + 300))
+                                    g2_boost = max(0, min(500, int(round(val_g2_final_boost)) + 300))
+
+                                    esp_peloton_b0   += p_peloton * V_next[g1_norm,  g2_norm,  0]
+                                    esp_peloton_keep += p_peloton * V_next[g1_norm,  g2_norm,  1]
+                                    esp_peloton_use  += p_peloton * V_next[g1_boost, g2_boost, 0]
+
+                                expected_v_b0   += aw * jp_base * esp_peloton_b0
+                                expected_v_keep += aw * jp_base * esp_peloton_keep
+                                expected_v_use  += aw * jp_base * esp_peloton_use
+
+                    if expected_v_b0 > best_v_b0: best_v_b0 = expected_v_b0
+                    best_action_b1 = max(expected_v_keep, expected_v_use)
+                    if best_action_b1 > best_v_b1: best_v_b1 = best_action_b1
+
+                V_current[g1, g2, 0] = best_v_b0
+                V_current[g1, g2, 1] = best_v_b1
+
+        # Symétrie Safe (triangle inférieur)
+        for g1 in prange(501):
+            for g2 in range(g1 + 1, 501):
+                V_current[g2, g1, 0] = V_current[g1, g2, 0]
+                V_current[g2, g1, 1] = V_current[g1, g2, 1]
+
+        V_next = V_current
+        V_all_matches[t] = V_current
+
+    return V_all_matches
+
+
+# ==========================================================================
 # DP coarse EXACT-AWARE : scores exacts sur les matchs renseignés, 1N2 sinon
 # ==========================================================================
 @njit

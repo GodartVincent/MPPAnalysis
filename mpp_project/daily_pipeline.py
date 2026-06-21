@@ -4,8 +4,8 @@ from collections import OrderedDict
 from datetime import date
 from pathlib import Path
 
-from mpp_project.core import apply_heteroscedastic_noise, apply_temporal_drift, build_exact_score_market, calculate_true_outcome_probas_from_odds, estimate_crowd_3D, expected_mpp_points, expected_simple_points, normalize_crowds, validate_match_dataframe
-from mpp_project.oracle_dp import compute_alphas_isolement, compute_full_Q_table, evaluate_exact_score_day, forward_propagate_exact, solve_dp_coarse, solve_dp_coarse_exact, GAP_MIN, GAP_MAX, GAP_OFFSET
+from mpp_project.core import apply_heteroscedastic_noise, apply_temporal_drift, build_exact_score_market, build_horizon_bonus_arrays, calibrate_horizon_bonus_model, calculate_true_outcome_probas_from_odds, estimate_crowd_3D, expected_mpp_points, expected_simple_points, normalize_crowds, validate_match_dataframe
+from mpp_project.oracle_dp import compute_alphas_isolement, compute_full_Q_table, evaluate_exact_score_day, forward_propagate_exact, solve_dp_coarse, solve_dp_coarse_exact, solve_dp_coarse_hbonus, GAP_MIN, GAP_MAX, GAP_OFFSET
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_DIR / "data"
@@ -179,6 +179,18 @@ def run_daily_pipeline(
                 f"figurer dans le CSV des scores exacts."
             )
 
+    # MODÈLE DE BONUS HORIZON (dé-biais du booster x2) : calibré sur TOUS les marchés
+    # renseignés, il donne un bonus de score exact SYNTHÉTIQUE aux matchs de la DP
+    # LOINTAINE (1N2 pur sinon) -> E[points] futurs réalistes -> la valeur de garder le
+    # x2 n'est plus sous-estimée. Inactif si aucune donnée (horizon laissé en 1N2).
+    hbonus_model = None
+    hb_q = hb_B = hb_opp = None
+    if exact_multi:
+        hbonus_model = calibrate_horizon_bonus_model(
+            exact_scores_by_match, base_true_probas, base_crowds=base_crowds
+        )
+        hb_q, hb_B, hb_opp = build_horizon_bonus_arrays(base_true_probas, hbonus_model)
+
     gains_f = gains_1N2.astype(np.float64) if exact_multi else None
     pemp_f = p_empirique_1D.astype(np.float64) if exact_multi else None
 
@@ -215,19 +227,28 @@ def run_daily_pipeline(
                                                  match_dates=match_dates, reference_date=reference_date)
             v_crowds = apply_heteroscedastic_noise(blended_mean_crowds, rmse=dynamic_rmse)
             v_alphas = compute_alphas_isolement(v_true_probas, v_crowds, gains_1N2, seuil_isolement=seuil_isolement)
-            V_far_s, _ = solve_dp_coarse(
-                base_true_probas=v_true_probas,
-                base_crowds=v_crowds,
-                gains_1N2=gains_1N2,
-                p_empirique_1D=p_empirique_1D,
-                alphas_isolement=v_alphas,
-                V_horizon=V_next_base_coarse,
-                stop_t=split_t,
-                horizon_nuit=0,
-                # start_t=n_matches : démarre à n_matches-1 SANS écraser V_horizon par
-                # le terminal interne -> chaîne réellement vers l'horizon des phases finales.
-                start_t=n_matches
-            )
+            if exact_multi and hbonus_model.active:
+                # Horizon lointain AVEC bonus de score exact synthétique (dé-biais x2).
+                # start_t=n_matches : chaîne vers l'horizon knockout sans l'écraser.
+                V_far_s = solve_dp_coarse_hbonus(
+                    v_true_probas, v_crowds, gains_1N2, p_empirique_1D, v_alphas,
+                    V_next_base_coarse, hb_q, hb_B, hb_opp,
+                    stop_t=split_t, start_t=n_matches,
+                )
+            else:
+                V_far_s, _ = solve_dp_coarse(
+                    base_true_probas=v_true_probas,
+                    base_crowds=v_crowds,
+                    gains_1N2=gains_1N2,
+                    p_empirique_1D=p_empirique_1D,
+                    alphas_isolement=v_alphas,
+                    V_horizon=V_next_base_coarse,
+                    stop_t=split_t,
+                    horizon_nuit=0,
+                    # start_t=n_matches : démarre à n_matches-1 SANS écraser V_horizon par
+                    # le terminal interne -> chaîne réellement vers l'horizon des phases finales.
+                    start_t=n_matches
+                )
             V_far_sum += V_far_s[split_t]
         V_far_avg = V_far_sum / n_runs  # shape (501, 501, 2)
     else:
