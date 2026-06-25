@@ -18,12 +18,16 @@ from mpp_project.bracket_simulator import (
     devig_group_odds,
 )
 from mpp_project.core import calibrate_qualification_probs
-from tests.helpers import DATA_DIR
+from tests.helpers import DATA_TESTS_DIR
 
-ODDS_PATH = DATA_DIR / "CDM_2026_group_stage_odds.csv"
+# Fixture FIGÉE (pré-tournoi, cotes toutes positives) : on NE teste PAS contre le CSV
+# de production live (data/CDM_2026_group_stage_odds.csv), que l'utilisateur édite en
+# cours de tournoi (cotes négatives = événements impossibles, ranks de qualification).
+# Tester l'algorithme sur un instantané stable évite des échecs dus aux données live.
+ODDS_PATH = DATA_TESTS_DIR / "CDM_2026_group_stage_odds.csv"
 
 pytestmark = pytest.mark.skipif(
-    not ODDS_PATH.exists(), reason="CDM_2026_group_stage_odds.csv absent."
+    not ODDS_PATH.exists(), reason="data/tests/CDM_2026_group_stage_odds.csv absent."
 )
 
 
@@ -170,6 +174,68 @@ def test_devig_group_odds(df_odds):
     assert cv.sum() == pytest.approx(1.0, abs=1e-6)
     assert q.sum() == pytest.approx(32.0, abs=1e-6)
     assert np.all((cv > 0.0) & (cv < 1.0)) and np.all((q > 0.0) & (q < 1.0))
+
+
+def test_devig_victoire_cote_negative_est_impossible(df_odds):
+    """Cote de victoire NÉGATIVE (équipe éliminée, convention in-play) -> proba 0,
+    et le marché des survivants reste dé-viggé (somme 1)."""
+    d = df_odds.copy()
+    d.loc[0, "cote_victoire"] = -1.0          # équipe 0 : éliminée
+    cv, _ = devig_group_odds(d)
+    assert cv[0] == 0.0
+    assert np.all(cv[1:] > 0.0)
+    assert cv.sum() == pytest.approx(1.0, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# rank : qualification IN-PLAY forcée (prend le pas sur les cotes)
+# ---------------------------------------------------------------------------
+def test_parse_ranks_classes(df_odds):
+    """rank 1/2/3 -> qualifié ; rank vide + cote_qualif<=0 -> éliminé ; sinon indéterminé."""
+    from mpp_project.bracket_simulator import parse_ranks
+    d = df_odds.copy()
+    d["rank"] = np.nan
+    d.loc[0, "rank"] = 1
+    d.loc[1, "rank"] = 3
+    d.loc[2, "cote_qualif"] = -1.0            # éliminé (pas de rank, cote négative)
+    rank_pos, is_qual, is_elim, is_undet = parse_ranks(d)
+    assert rank_pos[0] == 1 and is_qual[0]
+    assert rank_pos[1] == 3 and is_qual[1]
+    assert is_elim[2] and not is_qual[2]
+    assert is_undet[3]
+    # mutuellement exclusifs et couvrants
+    assert np.all(is_qual.astype(int) + is_elim.astype(int) + is_undet.astype(int) == 1)
+
+
+def test_devig_qualif_rank_force(df_odds):
+    """qualif = 1 pour les rankés (certains), 0 pour les éliminés, somme = 32."""
+    d = df_odds.copy()
+    d["rank"] = np.nan
+    d.loc[0, "rank"] = 1
+    d.loc[1, "rank"] = 2
+    d.loc[2, "rank"] = 3
+    d.loc[3, "cote_qualif"] = -1.0
+    _, q = devig_group_odds(d)
+    assert q[0] == 1.0 and q[1] == 1.0 and q[2] == 1.0
+    assert q[3] == 0.0
+    assert q.sum() == pytest.approx(32.0, abs=1e-6)
+
+
+def test_simulate_group_stages_force_rank(df_odds):
+    """Le rank FORCE la qualification ; total qualifiés inchangé (32)."""
+    d = df_odds.copy()
+    d["rank"] = np.nan
+    d.loc[0, "rank"] = 1                       # mexique 1er forcé
+    d.loc[1, "rank"] = 2                       # tchequie 2e forcé
+    d.loc[2, "rank"] = 3                       # coree_du_sud 3e qualifié
+    d.loc[3, "cote_qualif"] = -1.0             # afrique_du_sud éliminée
+    np.random.seed(1)
+    q1, q2, q3 = simulate_group_stages(d)
+    assert d.loc[0, "team"] in [x["team"] for x in q1]
+    assert d.loc[1, "team"] in [x["team"] for x in q2]
+    assert d.loc[2, "team"] in q3
+    assert d.loc[3, "team"] not in ([x["team"] for x in q1 + q2] + list(q3))
+    assert len(q1) + len(q2) + len(q3) == 32
 
 
 # ---------------------------------------------------------------------------

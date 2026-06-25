@@ -16,7 +16,9 @@ import pytest
 from mpp_project.end_game_solver import build_terminal_state, GAP_OFFSET
 from mpp_project.scorer_model import (
     top_scorer_joint_probs, calibrate_scorer_alphas, load_scorer_players, _calib_top_counts,
+    simulate_team_matches_played,
 )
+from tests.helpers import DATA_TESTS_DIR
 
 RNG_SEED = 12345
 
@@ -166,6 +168,24 @@ def test_calibration_monotone_alpha():
 # ---------------------------------------------------------------------------
 # 4. LECTURE DU STATE-TRACKER
 # ---------------------------------------------------------------------------
+def test_matches_played_respects_elimination():
+    """simulate_team_matches_played : une équipe éliminée (cote_qualif<=0, sans rank)
+    ne joue AUCUN match knockout dans l'arbre (exclue de la qualification)."""
+    path = DATA_TESTS_DIR / "CDM_2026_group_stage_odds.csv"
+    if not path.exists():
+        pytest.skip("fixture group_stage_odds absente")
+    d = pd.read_csv(path)
+    d["rank"] = np.nan
+    d.loc[d["team"] == "france", "cote_qualif"] = -1.0     # France éliminée
+    mm, names = simulate_team_matches_played(
+        d, n_runs=400, beta=0.95, seed=1, include_group_matches=False,
+    )
+    fr = list(names).index("france")
+    assert mm[:, fr].mean() == 0.0
+    # total apparitions knockout par tournoi = 64 (32 matchs x 2 équipes)
+    assert mm.sum(axis=1).mean() == pytest.approx(64.0, abs=1e-9)
+
+
 def test_load_scorer_players():
     df = pd.DataFrame({
         "category": ["favorite", "scorer", "scorer", "scorer", "scorer", "field"],

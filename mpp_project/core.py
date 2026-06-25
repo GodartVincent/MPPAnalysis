@@ -72,7 +72,7 @@ def get_ev_with_bonus(outcome_prob: float, perfect_prob_given_outcome: float, po
     expected_points_given_outcome = points * (1.0 + perfect_prob_given_outcome)
     return outcome_prob * expected_points_given_outcome
 
-def calculate_true_outcome_probas_from_odds(odds: np.ndarray) -> np.ndarray:
+def calculate_true_outcome_probas_from_odds(odds: np.ndarray, check_margin: bool = True) -> np.ndarray:
     """
     Calcule les probabilités vraies (sans marge bookmaker) à partir des cotes,
     via la méthode de Shin (`shin.calculate_implied_probabilities`) qui corrige
@@ -87,6 +87,14 @@ def calculate_true_outcome_probas_from_odds(odds: np.ndarray) -> np.ndarray:
 
     Invariant : si les cotes sont "justes" (somme des 1/cote == 1, aucune marge),
     Shin restitue exactement les probabilités implicites normalisées.
+
+    `check_margin` (défaut True) : émet les warnings de marge (somme 1/cote hors
+    [1, 1.15]) pour repérer une coquille dans un 1N2 du CSV. Mettre False pour les
+    calculs internes sur des marchés PARTIELS (ex. poids 1er-de-groupe sur un
+    sous-ensemble d'équipes, cf. bracket_simulator._first_place_weights), où une somme
+    < 1 est NORMALE et non une marge négative. De plus, toute ligne contenant une cote
+    <= 0 (marqueur in-play « impossible/résolu ») est un marché partiel -> contrôle
+    sauté automatiquement.
     """
     # Conversion en float pour éviter les divisions entières ou les types mixtes
     odds_array = np.asarray(odds, dtype=float)
@@ -105,7 +113,13 @@ def calculate_true_outcome_probas_from_odds(odds: np.ndarray) -> np.ndarray:
     # douteuse. Un marché outright partiel (favoris, buteurs) ne liste qu'un sous-
     # ensemble d'issues -> sa somme peut légitimement tomber sous 1 ou dépasser 1.15.
     for i, row in enumerate(events):
+        if not check_margin:
+            break
         if row.size > 3:
+            continue
+        # Marché PARTIEL (contient une issue résolue/impossible à cote <= 0, ou non
+        # finie) -> la notion de marge ne s'applique pas, on ne contrôle pas.
+        if np.any(~np.isfinite(row)) or np.any(row <= 0.0):
             continue
         with np.errstate(divide="ignore"):
             inv = 1.0 / row
@@ -125,13 +139,25 @@ def calculate_true_outcome_probas_from_odds(odds: np.ndarray) -> np.ndarray:
                 stacklevel=2,
             )
 
-    # Application de Shin par événement. Une ligne de cotes invalides
-    # (non finies ou <= 0) renvoie des probabilités nulles (cf. division par
-    # zéro historique).
+    # Application de Shin par événement. Les issues à cote NON POSITIVE (<= 0, ex.
+    # -1) ou non finie sont traitées comme IMPOSSIBLES (proba 0) et EXCLUES du dé-vig :
+    # Shin est appliqué sur les seules issues survivantes (proba sommant à 1 entre
+    # elles), 0 ailleurs. Convention in-play : marquer une cote à -1 retire l'issue
+    # devenue impossible (équipe éliminée -> victoire/qualif) sans casser le marché.
+    # Une seule issue survivante -> proba 1.
     def _shin_row(row: np.ndarray) -> np.ndarray:
-        if row.size == 0 or not np.all(np.isfinite(row)) or np.any(row <= 0.0):
-            return np.zeros_like(row)
-        return np.asarray(shin.calculate_implied_probabilities(row.tolist()), dtype=float)
+        row = np.asarray(row, dtype=float)
+        out = np.zeros(row.shape, dtype=float)
+        valid = np.isfinite(row) & (row > 0.0)
+        n_valid = int(valid.sum())
+        if n_valid == 0:
+            return out
+        if n_valid == 1:
+            out[valid] = 1.0
+            return out
+        sub = row[valid]
+        out[valid] = np.asarray(shin.calculate_implied_probabilities(sub.tolist()), dtype=float)
+        return out
 
     if odds_array.ndim == 2:
         return np.vstack([_shin_row(row) for row in odds_array])

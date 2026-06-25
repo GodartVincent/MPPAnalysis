@@ -13,17 +13,81 @@ from mpp_project.core import MAX_TRUE_PROBA, MIN_TRUE_PROBA, apply_temporal_drif
 N_QUALIFIED = 32
 
 
+def parse_ranks(df_odds):
+    """
+    Statut de qualification IN-PLAY de chaque équipe, depuis la colonne `rank`
+    (optionnelle) et le signe de `cote_qualif`. Aligné sur l'ordre des lignes.
+
+    Convention :
+      - rank ∈ {1, 2, 3}        -> QUALIFIÉ (1er / 2e / meilleur 3e), placement forcé ;
+      - rank absent + cote_qualif <= 0 (ou rank < 0) -> ÉLIMINÉ ;
+      - rank absent + cote_qualif > 0               -> INDÉTERMINÉ (tirage par cotes).
+
+    Le `rank` PREND LE PAS sur les cotes. Sans colonne `rank` (pré-tournoi) : toutes
+    indéterminées -> comportement historique.
+
+    Retour : (rank_pos (n,) int 0/1/2/3, is_qualified, is_eliminated, is_undetermined)
+    (les trois derniers : masques booléens mutuellement exclusifs).
+    """
+    n = len(df_odds)
+    if "rank" in df_odds.columns:
+        rank_raw = pd.to_numeric(df_odds["rank"], errors="coerce").values
+    else:
+        rank_raw = np.full(n, np.nan)
+    cote_q = np.asarray(df_odds["cote_qualif"].values, dtype=np.float64)
+
+    rank_pos = np.where(np.isin(rank_raw, [1.0, 2.0, 3.0]), rank_raw, 0.0).astype(np.int64)
+    is_qualified = rank_pos > 0
+    is_eliminated = (~is_qualified) & (((rank_raw < 0) & np.isfinite(rank_raw)) | (cote_q <= 0.0))
+    is_undetermined = ~is_qualified & ~is_eliminated
+    return rank_pos, is_qualified, is_eliminated, is_undetermined
+
+
+_FIRST_FLOOR_COTE = 1e6   # cote_1er <= 0 -> proba ~0 d'être 1er (mais équipe encore en lice)
+
+
+def _first_place_weights(cotes):
+    """Poids de tirage P(1er du groupe) ∝ Shin(cote_1er), robustes aux cotes <= 0.
+
+    Une `cote_1er <= 0` (ou non finie) signifie « ne peut (quasi) plus finir 1er » :
+    on la plancher à une très grosse cote (proba ~0) plutôt que de l'exclure du tirage
+    — l'équipe reste tirable pour le 2e/3e. Garantit des poids tous > 0 (sinon
+    np.random.choice(size=3) lèverait « Fewer non-zero entries in p than size »).
+    Cotes toutes positives -> Shin standard (comportement historique inchangé).
+    """
+    c = np.asarray(cotes, dtype=float).copy()
+    c[(~np.isfinite(c)) | (c <= 0.0)] = _FIRST_FLOOR_COTE
+    # check_margin=False : marché PARTIEL (sous-ensemble d'équipes / cotes planchées),
+    # somme(1/cote) < 1 NORMALE -> pas de warning de "marge négative".
+    w = np.asarray(calculate_true_outcome_probas_from_odds(c, check_margin=False), dtype=float)
+    s = w.sum()
+    return (w / s) if s > 0 else np.full(len(c), 1.0 / len(c))
+
+
 def devig_group_odds(df_odds):
     """
     Probabilités VRAIES (dé-viggées) par équipe, alignées sur l'ordre des lignes de df_odds :
-      - victoire finale : Shin sur cote_victoire (marché à vainqueur unique, somme = 1) ;
-      - qualification   : calibrate_qualification_probs sur 1/cote_qualif (multi-vainqueurs,
-                          somme = N_QUALIFIED).
+      - victoire finale : Shin sur cote_victoire (marché à vainqueur unique, somme = 1).
+        Une cote <= 0 (équipe éliminée) -> proba 0, marché renormalisé sur les survivants.
+      - qualification   : déterminée par le `rank` quand renseigné (cf. parse_ranks) :
+          * QUALIFIÉ (rank 1/2/3) -> qualif = 1 (certain) ;
+          * ÉLIMINÉ                -> qualif = 0 ;
+          * INDÉTERMINÉ            -> calibrate_qualification_probs sur 1/cote_qualif,
+            calibré pour sommer aux PLACES RESTANTES (N_QUALIFIED - nb déjà qualifiés).
+        Sans `rank` (pré-tournoi) : toutes indéterminées -> somme = N_QUALIFIED (historique).
     Remplace les 1/cote BRUTS (avec marge) utilisés auparavant pour la force conditionnelle
     et la survie (cf. conditional_matchup_prob).
     """
     true_cv = np.asarray(calculate_true_outcome_probas_from_odds(df_odds['cote_victoire'].values), dtype=np.float64)
-    true_qualif = calibrate_qualification_probs(1.0 / df_odds['cote_qualif'].values, target_sum=float(N_QUALIFIED))
+
+    _, is_qual, _, is_undet = parse_ranks(df_odds)
+    n = len(df_odds)
+    true_qualif = np.zeros(n, dtype=np.float64)
+    true_qualif[is_qual] = 1.0
+    n_remaining = float(N_QUALIFIED) - float(is_qual.sum())
+    if is_undet.any() and n_remaining > 0:
+        cote_q = np.asarray(df_odds["cote_qualif"].values, dtype=np.float64)[is_undet]
+        true_qualif[is_undet] = calibrate_qualification_probs(1.0 / cote_q, target_sum=n_remaining)
     return true_cv, true_qualif
 # On importe le solveur qu'on a codé précédemment
 from mpp_project.end_game_solver import solve_endgame_dp, build_terminal_state
@@ -143,56 +207,107 @@ def precompute_diluted_peloton(df_poules, df_odds_finales, n_brackets=10, n_runs
 # ==========================================
 def simulate_group_stages(df_odds, qualif_probs=None):
     """
-    Simule la phase de poule avec un proxy Plackett-Luce et l'équation des 3èmes.
-    Retourne les équipes qualifiées avec leurs slots.
+    Simule la phase de poule (proxy Plackett-Luce + équation des 3èmes) et renvoie
+    les qualifiés avec leurs slots.
+
+    RANK-AWARE (cf. parse_ranks) : une équipe au `rank` renseigné (1/2/3) est FORCÉE
+    à sa position (placement, pas de tirage) ; une éliminée est exclue ; les
+    indéterminées sont tirées par les cotes pour les positions restantes. Sans aucun
+    `rank` ni éliminé dans un groupe -> CHEMIN HISTORIQUE inchangé (reproductible).
 
     qualif_probs : probas de qualification VRAIES (dé-viggées) alignées sur df_odds
-        (cf. devig_group_odds). Si None, calculées en interne pour rester cohérent
-        avec generate_bracket_scenario. Utilisées pour la force des 3èmes (gamma).
+        (cf. devig_group_odds). Si None, calculées via devig_group_odds (rank-aware).
+        Utilisées pour la force des 3èmes (gamma) des groupes indéterminés.
     """
     if qualif_probs is None:
-        qualif_probs = calibrate_qualification_probs(
-            1.0 / df_odds['cote_qualif'].values, target_sum=float(N_QUALIFIED))
+        _, qualif_probs = devig_group_odds(df_odds)
 
-    df = df_odds.copy()
-    df['_qualif_true'] = qualif_probs  # aligné sur l'ordre des lignes de df_odds
+    rank_pos, _, is_elim, is_undet = parse_ranks(df_odds)
+    df = df_odds.copy().reset_index(drop=True)
+    df['_qualif_true'] = np.asarray(qualif_probs)
+    df['_rank_pos'] = rank_pos
+    df['_undet'] = is_undet
+    df['_elim'] = is_elim
     groups = df.groupby('group')
-    qualifiers_1st = []
-    qualifiers_2nd = []
-    third_places = []
 
-    for name, group in groups:
+    qualifiers_1st, qualifiers_2nd = [], []
+    forced_thirds = []                 # 3èmes QUALIFIÉS d'office (rank == 3)
+    cand_thirds = []                   # 3èmes candidats (groupes indéterminés)
+
+    def _draw_qualif(pool):
+        """Tire une équipe du pool ∝ qualif_true (force de QUALIFICATION), sans remise.
+        Sert au 3e (course au meilleur 3e) ET au 2e de repli : `cote_1er` est inadapté
+        ici (les équipes qui ne peuvent plus finir 1ère ont cote_1er<=0, et Shin
+        GONFLE les longshots planchés)."""
+        if not pool:
+            return None
+        w = np.array([max(t['_qualif_true'], 1e-12) for t in pool], dtype=float)
+        w = w / w.sum()
+        return pool.pop(int(np.random.choice(len(pool), p=w)))
+
+    def _draw_first(pool):
+        """Tire le 1er/2e parmi les équipes ENCORE capables de finir en tête
+        (cote_1er > 0), pondéré par Shin(cote_1er). Les équipes à cote_1er<=0
+        (ne peuvent plus finir 1ère) sont EXCLUES de ce tirage — elles se disputent
+        le 3e. Repli sur qualif_true si plus aucune équipe ne peut finir en tête."""
+        if not pool:
+            return None
+        elig = [t for t in pool if float(t['cote_1er']) > 0.0]
+        if not elig:
+            return _draw_qualif(pool)
+        w = _first_place_weights([t['cote_1er'] for t in elig])
+        chosen = elig[int(np.random.choice(len(elig), p=w))]
+        pool.remove(chosen)
+        return chosen
+
+    for _, group in groups:
         teams = group.to_dict('records')
+        # "Résolu" = info in-play présente : rank, éliminé, OU une cote_1er<=0 (équipe
+        # qui ne peut plus finir 1ère). Sinon groupe indéterminé -> chemin historique.
+        has_resolved = (any(t['_rank_pos'] > 0 for t in teams) or any(t['_elim'] for t in teams)
+                        or any(float(t['cote_1er']) <= 0.0 for t in teams))
+        gamma_group = max(0.01, float(np.sum([t['_qualif_true'] for t in teams])) - 2.0)
 
-        # Poids pour le tirage (basé sur la cote de finir 1er) : distribution
-        # P(1er du groupe) sur 4 équipes, dé-viggée par Shin puis renormalisée
-        # (np.random.choice exige une somme exacte de 1).
-        p1_weights = calculate_true_outcome_probas_from_odds(
-            np.array([t['cote_1er'] for t in teams]))
-        p1_weights = p1_weights / p1_weights.sum()
+        if not has_resolved:
+            # --- CHEMIN HISTORIQUE (groupe indéterminé) : 1er/2e/3e par cote_1er ---
+            p1 = _first_place_weights([t['cote_1er'] for t in teams])
+            idx = np.random.choice(4, size=3, replace=False, p=p1)
+            qualifiers_1st.append({'team': teams[idx[0]]['team'], 'slot': teams[idx[0]]['slot_1er']})
+            qualifiers_2nd.append({'team': teams[idx[1]]['team'], 'slot': teams[idx[1]]['slot_2e']})
+            cand_thirds.append({'team': teams[idx[2]]['team'], 'gamma': gamma_group})
+            continue
 
-        # Tirage séquentiel SANS REMISE (Proxy de Plackett-Luce)
-        indices = np.random.choice(4, size=3, replace=False, p=p1_weights)
+        # --- CHEMIN RANK-AWARE / IN-PLAY (groupe partiellement décidé) ---
+        f1 = next((t for t in teams if t['_rank_pos'] == 1), None)
+        f2 = next((t for t in teams if t['_rank_pos'] == 2), None)
+        f3 = next((t for t in teams if t['_rank_pos'] == 3), None)
+        pool = [t for t in teams if t['_undet']]
 
-        # 1er et 2ème
-        qualifiers_1st.append({'team': teams[indices[0]]['team'], 'slot': teams[indices[0]]['slot_1er']})
-        qualifiers_2nd.append({'team': teams[indices[1]]['team'], 'slot': teams[indices[1]]['slot_2e']})
+        first = f1 if f1 is not None else _draw_first(pool)    # 1er : parmi cote_1er>0
+        second = f2 if f2 is not None else _draw_first(pool)   # 2e  : idem (sinon repli qualif)
+        if first is not None:
+            qualifiers_1st.append({'team': first['team'], 'slot': first['slot_1er']})
+        if second is not None:
+            qualifiers_2nd.append({'team': second['team'], 'slot': second['slot_2e']})
 
-        # Le 3ème avec la force intrinsèque de son groupe (Gamma), sur probas dé-viggées
-        p_qual = np.array([t['_qualif_true'] for t in teams])
-        gamma_group = max(0.01, p_qual.sum() - 2.0) # Probabilité qu'un 3ème survive ici
+        if f3 is not None:
+            forced_thirds.append(f3['team'])          # qualifié 3e CERTAIN
+        else:
+            third = _draw_qualif(pool)                 # 3e candidat : force de QUALIFICATION
+            if third is not None:
+                cand_thirds.append({'team': third['team'], 'gamma': gamma_group})
 
-        third_places.append({
-            'team': teams[indices[2]]['team'],
-            'gamma': gamma_group
-        })
-        
-    # Tirage des 8 meilleurs 3èmes basé sur la force de leurs groupes
-    third_weights = np.array([t['gamma'] for t in third_places])
-    third_weights /= third_weights.sum()
-    best_thirds_idx = np.random.choice(12, size=8, replace=False, p=third_weights)
-    best_thirds = [third_places[i]['team'] for i in best_thirds_idx]
-    
+    # 8 meilleurs 3èmes : les forcés sont QUALIFIÉS ; on complète par gamma parmi les candidats.
+    n_remaining = 8 - len(forced_thirds)
+    chosen = []
+    if n_remaining > 0 and cand_thirds:
+        w = np.array([c['gamma'] for c in cand_thirds], dtype=float)
+        w = w / w.sum()
+        k = min(n_remaining, len(cand_thirds))
+        sel = np.random.choice(len(cand_thirds), size=k, replace=False, p=w)
+        chosen = [cand_thirds[i]['team'] for i in sel]
+    best_thirds = forced_thirds + chosen
+
     return qualifiers_1st, qualifiers_2nd, best_thirds
 
 def simulate_knockout_match_math(p_qualif_1, penalties_ratio, phase_str, 
@@ -833,16 +948,23 @@ def simulate_champion_distribution(df_odds, n_runs=200_000, beta=0.89, verbose=T
     cv_true = cv_true.astype(np.float64)
     name_to_id = {n: i for i, n in enumerate(team_names)}
 
+    # Statut de qualification rank-aware (cf. parse_ranks), aligné sur df_odds.
+    rank_pos_all, _, _, is_undet_all = parse_ranks(df_odds)
+    df_reset = df_odds.reset_index(drop=True)
+
     # Structures de groupes pré-calculées (évite tout pandas dans la boucle)
     groups = []
-    for _, grp in df_odds.groupby("group"):
+    for _, grp in df_reset.groupby("group"):
+        rows = grp.index.to_numpy()
         ids = np.array([name_to_id[str(t).strip().lower()] for t in grp["team"]], dtype=np.int64)
-        w = calculate_true_outcome_probas_from_odds(grp["cote_1er"].values)
-        w = w / w.sum()
+        cote1 = grp["cote_1er"].values.astype(np.float64)          # brute (signe = peut finir 1er ?)
+        qual = qualif_true[ids].astype(np.float64)                  # force de qualification (3e)
         s1 = grp["slot_1er"].values.astype(np.int64)
         s2 = grp["slot_2e"].values.astype(np.int64)
         gamma = max(0.01, float(qualif_true[ids].sum()) - 2.0)
-        groups.append((ids, w, s1, s2, gamma))
+        rank = rank_pos_all[rows].astype(np.int64)
+        undet = is_undet_all[rows]
+        groups.append((ids, cote1, qual, s1, s2, gamma, rank, undet))
 
     next_match_map = {0: (16, 0), 1: (16, 1), 2: (17, 0), 3: (17, 1), 4: (18, 0), 5: (18, 1),
                       6: (19, 0), 7: (19, 1), 8: (20, 0), 9: (20, 1), 10: (21, 0), 11: (21, 1),
@@ -854,46 +976,101 @@ def simulate_champion_distribution(df_odds, n_runs=200_000, beta=0.89, verbose=T
     counts = np.zeros(n_teams, dtype=np.int64)
     champion = -1
 
+    def _draw_first(pool, cote1, qual):
+        """1er/2e : tire parmi les équipes pouvant finir 1ère (cote_1er>0) ∝ Shin(cote_1er) ;
+        repli sur qualif_true si plus aucune. Renvoie l'indice (0-3) et le retire du pool."""
+        if not pool:
+            return -1
+        elig = [j for j in pool if cote1[j] > 0.0]
+        if elig:
+            ww = _first_place_weights(cote1[elig])
+            j = elig[int(np.random.choice(len(elig), p=ww))]
+        else:
+            ww = np.maximum(qual[pool], 1e-12)
+            ww = ww / ww.sum()
+            j = pool[int(np.random.choice(len(pool), p=ww))]
+        pool.remove(j)
+        return j
+
+    def _draw_qualif(pool, qual):
+        """3e : tire ∝ qualif_true (force de qualification), retire du pool."""
+        if not pool:
+            return -1
+        ww = np.maximum(qual[pool], 1e-12)
+        ww = ww / ww.sum()
+        return pool.pop(int(np.random.choice(len(pool), p=ww)))
+
     for run in range(n_runs):
         bracket = np.full((32, 2), -1, dtype=np.int64)
         surv = qualif_true.copy()  # P(qualifié en 16e) VRAIE ; réinitialisé chaque tournoi
 
-        # --- Poules ---
-        thirds, thirds_gamma = [], []
-        for (ids, w, s1, s2, gamma) in groups:
-            pick = np.random.choice(4, size=3, replace=False, p=w)
-            first, second, third = ids[pick[0]], ids[pick[1]], ids[pick[2]]
-            for team, slot in ((first, int(s1[pick[0]])), (second, int(s2[pick[1]]))):
-                if bracket[slot, 0] == -1:
-                    bracket[slot, 0] = team
-                else:
-                    bracket[slot, 1] = team
-            thirds.append(third)
-            thirds_gamma.append(gamma)
-        tg = np.array(thirds_gamma)
-        tg = tg / tg.sum()
-        best8 = np.random.choice(12, size=8, replace=False, p=tg)
-        q3 = [thirds[i] for i in best8]
+        # --- Poules (rank-aware : forçage des qualifiés connus, tirage des indéterminés) ---
+        forced_thirds = []
+        cand_thirds, cand_gamma = [], []
+        for (ids, cote1, qual, s1, s2, gamma, rank, undet) in groups:
+            has_resolved = bool((rank > 0).any() or ((~undet) & (rank == 0)).any()
+                                or (cote1 <= 0.0).any())
+            if not has_resolved:
+                # --- groupe indéterminé : 1er/2e/3e par cote_1er (historique) ---
+                w = _first_place_weights(cote1)
+                pick = np.random.choice(4, size=3, replace=False, p=w)
+                first, second, third = ids[pick[0]], ids[pick[1]], ids[pick[2]]
+                for team, slot in ((first, int(s1[pick[0]])), (second, int(s2[pick[1]]))):
+                    bracket[slot, 0 if bracket[slot, 0] == -1 else 1] = team
+                cand_thirds.append(third)
+                cand_gamma.append(gamma)
+                continue
+
+            # --- in-play : 1er/2e parmi cote_1er>0, 3e par qualif ---
+            pool = [j for j in range(4) if undet[j]]
+            i1 = int(np.where(rank == 1)[0][0]) if (rank == 1).any() else _draw_first(pool, cote1, qual)
+            i2 = int(np.where(rank == 2)[0][0]) if (rank == 2).any() else _draw_first(pool, cote1, qual)
+            if i1 >= 0:
+                bracket[int(s1[i1]), 0 if bracket[int(s1[i1]), 0] == -1 else 1] = ids[i1]
+            if i2 >= 0:
+                bracket[int(s2[i2]), 0 if bracket[int(s2[i2]), 0] == -1 else 1] = ids[i2]
+            if (rank == 3).any():
+                forced_thirds.append(int(ids[int(np.where(rank == 3)[0][0])]))
+            else:
+                tj = _draw_qualif(pool, qual)
+                if tj >= 0:
+                    cand_thirds.append(int(ids[tj]))
+                    cand_gamma.append(gamma)
+
+        n_take = 8 - len(forced_thirds)
+        chosen = []
+        if n_take > 0 and cand_thirds:
+            tg = np.array(cand_gamma, dtype=float)
+            tg = tg / tg.sum()
+            k = min(n_take, len(cand_thirds))
+            sel = np.random.choice(len(cand_thirds), size=k, replace=False, p=tg)
+            chosen = [cand_thirds[i] for i in sel]
+        q3 = forced_thirds + chosen
         np.random.shuffle(q3)
         qi = 0
         for m in range(16):
             for s in range(2):
-                if bracket[m, s] == -1:
+                if bracket[m, s] == -1 and qi < len(q3):
                     bracket[m, s] = q3[qi]
                     qi += 1
 
         # --- Knockout ---
         for m in range(32):
             t1, t2 = bracket[m, 0], bracket[m, 1]
-            s_a = cv_true[t1] / surv[t1] ** beta
-            s_b = cv_true[t2] / surv[t2] ** beta
-            p1 = s_a / (s_a + s_b)
-            p1 = min(HI, max(LO, p1 + np.random.normal(0, SIG)))
-            if np.random.rand() < p1:
-                winner, pw = t1, p1
+            if t1 < 0 or t2 < 0:
+                # slot non rempli (données rank incomplètes) : avance l'équipe valide.
+                winner = t1 if t2 < 0 else t2
             else:
-                winner, pw = t2, 1.0 - p1
-            surv[winner] *= pw
+                s_a = cv_true[t1] / surv[t1] ** beta
+                s_b = cv_true[t2] / surv[t2] ** beta
+                denom = s_a + s_b
+                p1 = 0.5 if denom <= 0.0 else s_a / denom
+                p1 = min(HI, max(LO, p1 + np.random.normal(0, SIG)))
+                if np.random.rand() < p1:
+                    winner, pw = t1, p1
+                else:
+                    winner, pw = t2, 1.0 - p1
+                surv[winner] *= pw
             if m in next_match_map:
                 nm, slot = next_match_map[m]
                 bracket[nm, slot] = winner
@@ -915,6 +1092,6 @@ def simulate_champion_distribution(df_odds, n_runs=200_000, beta=0.89, verbose=T
 if __name__ == "__main__":
     # Test avec 15 arbres pour être rapide au quotidien (Modifiable le Jour J)
     # ~486 s/itération sur CPU (i5-12400) ; 15 itérations = ~1h15 ; 2 itérations = ~10 min.
-    compute_robust_endgame_horizon(my_fav="france", my_scorer="autre", n_simulations=100,
-                                   known_favorites=["espagne", "espagne", "france", "france", "france", "espagne"],
-                                   known_scorers=  ["harry_kane", "harry_kane", "autre", "autre", "harry_kane", "kylian_mbappe"],)
+    compute_robust_endgame_horizon(my_fav="france", my_scorer="autre", n_simulations=95,
+                                   known_favorites=["espagne", "espagne", "france", "france", "angleterre", "espagne"],
+                                   known_scorers=  ["harry_kane", "harry_kane", "autre", "autre", "lamine_yamal", "kylian_mbappe"],)

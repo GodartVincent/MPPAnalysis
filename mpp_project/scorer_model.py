@@ -74,13 +74,19 @@ def _gumbel_key(logw):
 # ==========================================================================
 @njit
 def _simulate_matches_played_core(
-    group_team_ids, group_logw, group_slot1, group_slot2, group_gamma,
+    group_team_ids, group_logw, group_qlogw, group_can_first, group_resolved,
+    group_slot1, group_slot2, group_gamma, group_rank, group_undet,
     cv_true, qualif_true, next_m, next_slot, n_teams, n_runs, beta,
 ):
-    """Pour n_runs tournois complets (poules Plackett-Luce + knockout à force
-    conditionnelle), renvoie counts (n_runs, n_teams) = nombre de matchs KNOCKOUT
-    joués par chaque équipe (les matchs de poule, constants à 3, sont ajoutés par
-    l'appelant). Mirroir njit de bracket_simulator.simulate_champion_distribution."""
+    """Pour n_runs tournois (poules Plackett-Luce + knockout à force conditionnelle),
+    renvoie counts (n_runs, n_teams) = nombre de matchs KNOCKOUT joués par équipe
+    (la composante poule est ajoutée par l'appelant).
+
+    RANK-AWARE : `group_rank[grp, j]` ∈ {0,1,2,3} (0 = à tirer), `group_undet[grp, j]`
+    = équipe indéterminée (tirable). Les équipes au rank sont FORCÉES (1er/2e à leur
+    slot, 3e qualifié d'office) ; les éliminées (ni rank ni undet) sont exclues ; on
+    ne tire (Gumbel = Plackett-Luce) que parmi les indéterminées pour les positions
+    libres. Sans rank ni éliminé -> équivalent au tirage historique sur les 4."""
     n_groups = group_team_ids.shape[0]
     out = np.zeros((n_runs, n_teams), dtype=np.int64)
 
@@ -88,59 +94,141 @@ def _simulate_matches_played_core(
         bracket = np.full((32, 2), -1, dtype=np.int64)
         surv = qualif_true.copy()
 
-        thirds = np.empty(n_groups, dtype=np.int64)
-        thirds_gamma = np.empty(n_groups, dtype=np.float64)
+        forced_ids = np.empty(n_groups, dtype=np.int64)   # 3es qualifiés d'office
+        n_forced = 0
+        cand_ids = np.empty(n_groups, dtype=np.int64)      # 3es candidats (indéterminés)
+        cand_keys = np.empty(n_groups, dtype=np.float64)
+        n_cand = 0
 
-        # --- Poules : 1er / 2e / 3e de chaque groupe via Gumbel-top-3 ---
         for grp in range(n_groups):
-            keys = np.empty(4, dtype=np.float64)
+            keys = np.empty(4, dtype=np.float64)     # Gumbel ∝ cote_1er (1er/2e)
+            qkeys = np.empty(4, dtype=np.float64)     # Gumbel ∝ qualif_true (3e)
             for j in range(4):
                 keys[j] = _gumbel_key(group_logw[grp, j])
-            # top-3 ordonné (sélection par maxima successifs)
-            order = np.full(3, -1, dtype=np.int64)
+                qkeys[j] = _gumbel_key(group_qlogw[grp, j])
+            resolved = group_resolved[grp]            # groupe in-play partiellement décidé
             used = np.zeros(4, dtype=np.bool_)
-            for r in range(3):
-                best = -1
-                best_k = -1e18
-                for j in range(4):
-                    if not used[j] and keys[j] > best_k:
-                        best_k = keys[j]
-                        best = j
-                order[r] = best
-                used[best] = True
+            i1 = -1
+            i2 = -1
+            i3 = -1
+            for j in range(4):
+                r = group_rank[grp, j]
+                if r == 1:
+                    i1 = j
+                elif r == 2:
+                    i2 = j
+                elif r == 3:
+                    i3 = j
+                if (not group_undet[grp, j]) and r == 0:
+                    used[j] = True            # éliminée : exclue du tirage
 
-            first = group_team_ids[grp, order[0]]
-            second = group_team_ids[grp, order[1]]
-            s1 = group_slot1[grp, order[0]]
-            s2 = group_slot2[grp, order[1]]
-            for team, slot in ((first, s1), (second, s2)):
+            # 1er : forcé, sinon tiré parmi les équipes pouvant finir 1ère (cote_1er>0
+            # si résolu), ∝ cote_1er ; repli sur qualif si aucune éligible.
+            if i1 >= 0:
+                fj = i1
+                used[i1] = True
+            else:
+                fj = -1
+                bk = -1e18
+                for j in range(4):
+                    if ((not used[j]) and group_undet[grp, j]
+                            and ((not resolved) or group_can_first[grp, j]) and keys[j] > bk):
+                        bk = keys[j]
+                        fj = j
+                if fj < 0:
+                    bk = -1e18
+                    for j in range(4):
+                        if (not used[j]) and group_undet[grp, j] and qkeys[j] > bk:
+                            bk = qkeys[j]
+                            fj = j
+                if fj >= 0:
+                    used[fj] = True
+            # 2e : même logique que le 1er
+            if i2 >= 0:
+                sj = i2
+                used[i2] = True
+            else:
+                sj = -1
+                bk = -1e18
+                for j in range(4):
+                    if ((not used[j]) and group_undet[grp, j]
+                            and ((not resolved) or group_can_first[grp, j]) and keys[j] > bk):
+                        bk = keys[j]
+                        sj = j
+                if sj < 0:
+                    bk = -1e18
+                    for j in range(4):
+                        if (not used[j]) and group_undet[grp, j] and qkeys[j] > bk:
+                            bk = qkeys[j]
+                            sj = j
+                if sj >= 0:
+                    used[sj] = True
+
+            if fj >= 0:
+                team = group_team_ids[grp, fj]
+                slot = group_slot1[grp, fj]
                 if bracket[slot, 0] == -1:
                     bracket[slot, 0] = team
                 else:
                     bracket[slot, 1] = team
-            thirds[grp] = group_team_ids[grp, order[2]]
-            thirds_gamma[grp] = group_gamma[grp]
+            if sj >= 0:
+                team = group_team_ids[grp, sj]
+                slot = group_slot2[grp, sj]
+                if bracket[slot, 0] == -1:
+                    bracket[slot, 0] = team
+                else:
+                    bracket[slot, 1] = team
 
-        # --- 8 meilleurs 3es via Gumbel-top-8 sur les 12 (poids = gamma) ---
-        tkeys = np.empty(n_groups, dtype=np.float64)
-        for grp in range(n_groups):
-            tkeys[grp] = _gumbel_key(np.log(thirds_gamma[grp]))
-        used_t = np.zeros(n_groups, dtype=np.bool_)
-        q3 = np.empty(8, dtype=np.int64)
-        for r in range(8):
+            # 3e : forcé (qualifié), sinon candidat tiré ∝ qualif_true (si résolu) ou
+            # ∝ cote_1er (groupe indéterminé, comportement historique).
+            if i3 >= 0:
+                forced_ids[n_forced] = group_team_ids[grp, i3]
+                n_forced += 1
+                used[i3] = True
+            else:
+                tj = -1
+                bk = -1e18
+                for j in range(4):
+                    kk = qkeys[j] if resolved else keys[j]
+                    if (not used[j]) and group_undet[grp, j] and kk > bk:
+                        bk = kk
+                        tj = j
+                if tj >= 0:
+                    used[tj] = True
+                    cand_ids[n_cand] = group_team_ids[grp, tj]
+                    cand_keys[n_cand] = _gumbel_key(np.log(group_gamma[grp]))
+                    n_cand += 1
+
+        # 8 meilleurs 3es : forcés d'office + complétés par Gumbel-top parmi les candidats.
+        n_take = 8 - n_forced
+        if n_take < 0:
+            n_take = 0
+        taken = np.zeros(n_cand, dtype=np.bool_)
+        for _ in range(n_take):
             best = -1
-            best_k = -1e18
-            for grp in range(n_groups):
-                if not used_t[grp] and tkeys[grp] > best_k:
-                    best_k = tkeys[grp]
-                    best = grp
-            q3[r] = thirds[best]
-            used_t[best] = True
+            bk = -1e18
+            for c in range(n_cand):
+                if (not taken[c]) and cand_keys[c] > bk:
+                    bk = cand_keys[c]
+                    best = c
+            if best >= 0:
+                taken[best] = True
+
+        q3 = np.empty(8, dtype=np.int64)
+        nq3 = 0
+        for k in range(n_forced):
+            if nq3 < 8:
+                q3[nq3] = forced_ids[k]
+                nq3 += 1
+        for c in range(n_cand):
+            if taken[c] and nq3 < 8:
+                q3[nq3] = cand_ids[c]
+                nq3 += 1
 
         qi = 0
         for m in range(16):
             for s in range(2):
-                if bracket[m, s] == -1:
+                if bracket[m, s] == -1 and qi < nq3:
                     bracket[m, s] = q3[qi]
                     qi += 1
 
@@ -148,21 +236,26 @@ def _simulate_matches_played_core(
         for m in range(32):
             t1 = bracket[m, 0]
             t2 = bracket[m, 1]
-            s_a = cv_true[t1] / surv[t1] ** beta
-            s_b = cv_true[t2] / surv[t2] ** beta
-            p1 = s_a / (s_a + s_b)
-            p1 = p1 + np.random.normal(0.0, _SIG)
-            if p1 < _LO:
-                p1 = _LO
-            elif p1 > _HI:
-                p1 = _HI
-            if np.random.random() < p1:
-                winner = t1
-                pw = p1
+            if t1 < 0 or t2 < 0:
+                # slot non rempli (données incomplètes) : avance l'équipe valide, pas de tirage.
+                winner = t1 if t2 < 0 else t2
             else:
-                winner = t2
-                pw = 1.0 - p1
-            surv[winner] *= pw
+                s_a = cv_true[t1] / surv[t1] ** beta
+                s_b = cv_true[t2] / surv[t2] ** beta
+                denom = s_a + s_b
+                p1 = 0.5 if denom <= 0.0 else s_a / denom
+                p1 = p1 + np.random.normal(0.0, _SIG)
+                if p1 < _LO:
+                    p1 = _LO
+                elif p1 > _HI:
+                    p1 = _HI
+                if np.random.random() < p1:
+                    winner = t1
+                    pw = p1
+                else:
+                    winner = t2
+                    pw = 1.0 - p1
+                surv[winner] *= pw
 
             nm = next_m[m]
             if nm >= 0:
@@ -176,8 +269,10 @@ def _simulate_matches_played_core(
 
         # Comptage des matchs knockout joués (apparitions dans le bracket réalisé)
         for m in range(32):
-            out[run, bracket[m, 0]] += 1
-            out[run, bracket[m, 1]] += 1
+            if bracket[m, 0] >= 0:
+                out[run, bracket[m, 0]] += 1
+            if bracket[m, 1] >= 0:
+                out[run, bracket[m, 1]] += 1
 
     return out
 
@@ -231,7 +326,9 @@ def simulate_team_matches_played(df_odds, n_runs=20000, beta=0.95, seed=None,
 
     Retour : (matches (n_runs, n_teams) int, team_names (n_teams,)).
     """
-    from mpp_project.bracket_simulator import devig_group_odds, N_QUALIFIED
+    from mpp_project.bracket_simulator import (
+        devig_group_odds, parse_ranks, _first_place_weights, N_QUALIFIED,
+    )
 
     if seed is not None:
         np.random.seed(seed)
@@ -245,25 +342,41 @@ def simulate_team_matches_played(df_odds, n_runs=20000, beta=0.95, seed=None,
     cv_true = cv_true.astype(np.float64)
     qualif_true = qualif_true.astype(np.float64)
 
+    # Statut de qualification par équipe (rank-aware), aligné sur l'ordre de df_odds.
+    rank_pos_all, _, is_elim_all, is_undet_all = parse_ranks(df_odds)
+
     # Structures de groupes (4 équipes / groupe)
     grp_keys = list(dict.fromkeys(df_odds["group"].tolist()))
     n_groups = len(grp_keys)
     group_team_ids = np.full((n_groups, 4), -1, dtype=np.int64)
     group_logw = np.zeros((n_groups, 4), dtype=np.float64)
+    group_qlogw = np.full((n_groups, 4), np.log(1e-12), dtype=np.float64)  # ∝ qualif_true (3e)
+    group_can_first = np.zeros((n_groups, 4), dtype=np.bool_)              # cote_1er > 0 ?
+    group_resolved = np.zeros(n_groups, dtype=np.bool_)                    # groupe in-play décidé ?
     group_slot1 = np.zeros((n_groups, 4), dtype=np.int64)
     group_slot2 = np.zeros((n_groups, 4), dtype=np.int64)
     group_gamma = np.zeros(n_groups, dtype=np.float64)
+    group_rank = np.zeros((n_groups, 4), dtype=np.int64)
+    group_undet = np.zeros((n_groups, 4), dtype=np.bool_)
 
+    df_reset = df_odds.reset_index(drop=True)
     for gi, gkey in enumerate(grp_keys):
-        grp = df_odds[df_odds["group"] == gkey]
+        grp = df_reset[df_reset["group"] == gkey]
+        rows = grp.index.to_numpy()                       # positions dans df_odds
         ids = np.array([name_to_id[str(t).strip().lower()] for t in grp["team"]], dtype=np.int64)
-        w = calculate_true_outcome_probas_from_odds(grp["cote_1er"].values)
-        w = w / w.sum()
+        cote1 = grp["cote_1er"].values.astype(np.float64)
+        w = _first_place_weights(cote1)                    # robuste aux cote_1er <= 0
         group_team_ids[gi, :len(ids)] = ids
         group_logw[gi, :len(ids)] = np.log(np.clip(w, 1e-12, None))
+        group_qlogw[gi, :len(ids)] = np.log(np.clip(qualif_true[ids], 1e-12, None))
+        group_can_first[gi, :len(ids)] = cote1 > 0.0
         group_slot1[gi, :len(ids)] = grp["slot_1er"].values.astype(np.int64)
         group_slot2[gi, :len(ids)] = grp["slot_2e"].values.astype(np.int64)
         group_gamma[gi] = max(0.01, float(qualif_true[ids].sum()) - 2.0)
+        group_rank[gi, :len(ids)] = rank_pos_all[rows]
+        group_undet[gi, :len(ids)] = is_undet_all[rows]
+        group_resolved[gi] = bool((rank_pos_all[rows] > 0).any() or is_elim_all[rows].any()
+                                  or (cote1 <= 0.0).any())
 
     # next_match_map -> arrays
     next_match_map = {0: (16, 0), 1: (16, 1), 2: (17, 0), 3: (17, 1), 4: (18, 0), 5: (18, 1),
@@ -278,7 +391,8 @@ def simulate_team_matches_played(df_odds, n_runs=20000, beta=0.95, seed=None,
         next_slot[m] = slot
 
     ko = _simulate_matches_played_core(
-        group_team_ids, group_logw, group_slot1, group_slot2, group_gamma,
+        group_team_ids, group_logw, group_qlogw, group_can_first, group_resolved,
+        group_slot1, group_slot2, group_gamma, group_rank, group_undet,
         cv_true, qualif_true, next_m, next_slot, n_teams, int(n_runs), float(beta),
     )
     if group_matches_per_team is not None:
