@@ -165,6 +165,21 @@ def test_surface_injecte_les_zeros():
     assert new.bonus[i30] >= 50
 
 
+def test_crowd_only_scores_comptent_au_denominateur():
+    """Un score avec crowd mais SANS cote n'est pas pariable, mais son crowd abaisse le
+    crowd conditionnel des scores pariables du MÊME outcome (dénominateur élargi).
+    Les autres outcomes restent inchangés. (Teste l'effet pur via shape_correction=False.)"""
+    base = {"1-0": (3.0, 30.0), "2-0": (5.0, 20.0), "0-1": (8.0, 10.0)}
+    extra = dict(base); extra["3-0"] = (None, 40.0)   # gros crowd, aucune cote
+    m0 = build_exact_score_market(base, shape_correction=False)
+    m1 = build_exact_score_market(extra, shape_correction=False)
+    assert "3-0" not in m1.scores and set(m0.scores) == set(m1.scores)   # non pariable
+    i0, i1 = m0.scores.index("1-0"), m1.scores.index("1-0")
+    assert m1.cond_crowd[i1] < m0.cond_crowd[i0]                          # victoire abaissée
+    j0, j1 = m0.scores.index("0-1"), m1.scores.index("0-1")
+    assert m1.cond_crowd[j1] == pytest.approx(m0.cond_crowd[j0])          # défaite inchangée
+
+
 def test_build_market_creux_renormalise():
     # Marché très partiel (somme 1/cote = 0.4) : les probas listées sont quand même
     # renormalisées à 1 (masse résiduelle repliée sur les scores listés).

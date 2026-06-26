@@ -181,7 +181,10 @@ def test_reco_outcome_quasi_certain(tmp_path):
 # ===========================================================================
 # 2. INTÉGRATION sur les CSV réalistes de data/tests/
 # ===========================================================================
-FIXTURE_CSVS = sorted(DATA_TESTS_DIR.glob("*.csv")) if DATA_TESTS_DIR.exists() else []
+# Préfixe `test_*` : on ne prend QUE les fixtures de matchs (schéma phase/cote_1/...),
+# pas les autres CSV de data/tests/ (ex. CDM_2026_group_stage_odds.csv = cotes de
+# groupe pour test_bracket_simulator, schéma incompatible -> KeyError 'phase').
+FIXTURE_CSVS = sorted(DATA_TESTS_DIR.glob("test_*.csv")) if DATA_TESTS_DIR.exists() else []
 
 
 @pytest.mark.skipif(not FIXTURE_CSVS, reason="Aucun CSV dans data/tests/.")

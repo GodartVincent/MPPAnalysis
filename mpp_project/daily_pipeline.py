@@ -5,6 +5,7 @@ from datetime import date
 from pathlib import Path
 
 from mpp_project.core import apply_heteroscedastic_noise, apply_temporal_drift, build_exact_score_market, build_horizon_bonus_arrays, calibrate_horizon_bonus_model, calculate_true_outcome_probas_from_odds, estimate_crowd_3D, expected_mpp_points, expected_simple_points, normalize_crowds, validate_match_dataframe
+from mpp_project.extra_time import build_exact_score_market_120, devig_to_qualify, get_120m_outcome_probas
 from mpp_project.oracle_dp import compute_alphas_isolement, compute_full_Q_table, evaluate_exact_score_day, forward_propagate_exact, solve_dp_coarse, solve_dp_coarse_exact, solve_dp_coarse_hbonus, GAP_MIN, GAP_MAX, GAP_OFFSET
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -452,6 +453,387 @@ def run_daily_pipeline(
         best_action = np.argmax(wr_base)
         reco = f"{noms_choix[best_action]}"
         best_wr = wr_base[best_action]
+
+    return reco, best_wr, ev_actions, Q_table_jour
+
+
+def _is_nation_alive(nation: str, df: pd.DataFrame) -> bool:
+    """
+    True si la nation est encore en lice dans les phases finales du tournoi.
+
+    Logique :
+      - La nation doit apparaître dans au moins un match KO (team_A ou team_B).
+        Si elle est absente de tous les matchs KO (éliminée en poules ou nom
+        inconnu) → False.
+      - Si elle a perdu un match KO dont le résultat est renseigné → False.
+      - Sinon → True (encore en lice ou match KO pas encore joué).
+    """
+    ko_phases = {"16e", "8e", "quart", "demi", "finale"}
+    nat = str(nation).strip().lower()
+
+    ko_df = df[df["phase"].isin(ko_phases)]
+    in_ko = (
+        ko_df["team_A"].str.strip().str.lower().eq(nat) |
+        ko_df["team_B"].str.strip().str.lower().eq(nat)
+    ).any()
+    if not in_ko:
+        return False
+
+    for _, row in ko_df.iterrows():
+        res = str(row.get("result", "")).strip().lower()
+        if res in ("", "nan", "none"):
+            continue
+        a = str(row["team_A"]).strip().lower()
+        b = str(row["team_B"]).strip().lower()
+        if a == nat and res == b:
+            return False
+        if b == nat and res == a:
+            return False
+
+    return True
+
+
+def run_pf_pipeline(
+    csv_path: Path,
+    match_id_cible: int,
+    my_fav_nation: str,
+    bob_fav_nation: str,
+    pack_fav_nation: str,
+    mon_gap_1: int = 0,
+    mon_gap_2: int = 0,
+    has_booster: int = 1,
+    horizon_nuit: int = 4,
+    seuil_isolement: float = 80.0,
+    p_empirique_override=None,
+    v_pf_full_override=None,
+    save_abaques: bool = True,
+    validate_input: bool = True,
+    exact_scores_by_match=None,
+    reference_date=None,
+):
+    """
+    Pipeline de décision pour les phases finales (matchs 73–104).
+    Analogue à run_daily_pipeline, avec :
+      - Horizon issu de expected_V_phases_finales_full.npy (7D, shape
+        (32, 1001, 1001, 2, 2, 2, 2)) tranché par (my_fav_alive, bob_fav_alive,
+        pack_fav_alive) — détectés automatiquement depuis les résultats CSV.
+      - Pas de DP lointain avec drift : l'horizon PF pré-calculé joue ce rôle.
+      - Même near-DP exact-aware + passe forward que run_daily_pipeline.
+      - alpha calculé empiriquement (converge vers ~1.0 en PF, peloton dilué).
+
+    Paramètres fav : noms de nations (snake_case, insensible à la casse) des
+    favoris de l'agent (my_fav_nation), de Bob (bob_fav_nation) et du peloton
+    (pack_fav_nation). Leur survie est déduite des résultats CSV.
+
+    v_pf_full_override : ndarray (32, 1001, 1001, 2, 2, 2, 2), optionnel. Si
+    fourni, remplace le chargement de expected_V_phases_finales_full.npy.
+
+    Contrat de retour identique à run_daily_pipeline :
+      - mode 1N2   : (reco, best_wr, ev_actions, Q_table_jour)
+      - mode exact : (reco, best_wr, market_df,  Q_table_jour)
+      - mode multi : (reco, best_wr, market_df,  Q_table_jour, night_markets)
+    """
+    import warnings as _warnings
+
+    match_idx = match_id_cible - 1       # index global (0-based)
+    t_pf = match_idx - 72                # index phases finales (0-based)
+
+    # ==========================================
+    # 1. CHARGEMENT DES DONNÉES
+    # ==========================================
+    df = pd.read_csv(csv_path)
+    if validate_input:
+        validate_match_dataframe(df)
+
+    n_matches = len(df)
+    if match_idx >= n_matches:
+        raise ValueError(
+            f"match_id_cible={match_id_cible} absent du CSV ({n_matches} lignes). "
+            f"Assure-toi que CDM_2026.csv contient les lignes des phases finales "
+            f"(match_id >= 73) avant de lancer run_pf_pipeline."
+        )
+
+    match_phases = df['phase'].tolist()
+    match_dates = pd.to_datetime(df['date']).to_numpy() if 'date' in df.columns else None
+
+    odds = df[['cote_1', 'cote_N', 'cote_2']].values.astype(np.float64)
+    base_true_probas = calculate_true_outcome_probas_from_odds(odds)
+    base_crowds = normalize_crowds(df[['crowd_1', 'crowd_N', 'crowd_2']].values,
+                                   label="pf", warn=validate_input)
+    gains_1N2 = df[['gain_mpp_1', 'gain_mpp_N', 'gain_mpp_2']].values.astype(np.int32)
+
+    # --- CORRECTION 120' (PROLONGATIONS) sur les matchs KO ---
+    # MPP score à 120' mais les cotes sont à 90' : en knockout un nul à 90' part
+    # toujours en prolongation. On garde le 1N2@90 (base_true_probas_90) pour
+    # CONSTRUIRE les marchés de scores exacts (fit Dixon-Coles 90'), et on remplace
+    # le 1N2 utilisé par l'HORIZON DP par le 1N2@120 (via le marché 'to qualify' ->
+    # get_120m_outcome_probas ; fallback prior z=0.45 si cote_qualif absente). Les
+    # gains MPP restent calculés sur les cotes 90' (inchangés). Crowds 1N2 = CDM (MPP
+    # 120', fiables). Poules : aucune ligne KO -> base_true_probas inchangé.
+    base_true_probas_90 = base_true_probas.copy()
+    _KO_PHASES = {"16e", "8e", "quart", "demi", "finale"}
+    is_ko = df['phase'].astype(str).str.strip().str.lower().isin(_KO_PHASES).to_numpy()
+    has_qualif_cols = {'cote_qualif_A', 'cote_qualif_B'} <= set(df.columns)
+    qa_by_idx = {}
+    for idx in range(n_matches):
+        if not is_ko[idx]:
+            continue
+        Q_A = None
+        if has_qualif_cols:
+            Q_A = devig_to_qualify(df['cote_qualif_A'].iloc[idx],
+                                   df['cote_qualif_B'].iloc[idx])
+        qa_by_idx[idx] = Q_A
+        pA, pN, pB = base_true_probas_90[idx]
+        pA120, pN120, pB120 = get_120m_outcome_probas(pA, pB, pN, Q_A)
+        base_true_probas[idx] = (pA120, pN120, pB120)
+
+    ev_actions = base_true_probas[match_idx] * gains_1N2[match_idx]
+
+    if p_empirique_override is not None:
+        p_empirique_1D = p_empirique_override[:n_matches]
+    else:
+        p_empirique_1D_full = np.load(DATA_DIR / "p_empirique_1D.npy")
+        p_empirique_1D = p_empirique_1D_full[:n_matches]
+    max_gain_dynamique = p_empirique_1D.shape[2]
+
+    base_alphas = compute_alphas_isolement(base_true_probas, base_crowds, gains_1N2,
+                                           seuil_isolement=seuil_isolement)
+
+    # ==========================================
+    # 2. DÉTECTION FAV ALIVE + HORIZON 7D
+    # ==========================================
+    my_fav_alive  = int(_is_nation_alive(my_fav_nation,   df))
+    bob_fav_alive = int(_is_nation_alive(bob_fav_nation,  df))
+    pack_fav_alive = int(_is_nation_alive(pack_fav_nation, df))
+
+    if v_pf_full_override is not None:
+        V_pf_full = v_pf_full_override
+    else:
+        V_pf_full = np.load(DATA_DIR / "expected_V_phases_finales_full.npy")
+    # shape : (32, 1001, 1001, 2, 2, 2, 2)
+
+    n_pf_matches = V_pf_full.shape[0]                              # 32
+    horizon_effectif = min(horizon_nuit, n_matches - match_idx, n_pf_matches - t_pf)
+
+    # V_horizon : slice PF au bord de la fenêtre (V après match t_pf + horizon_effectif).
+    # On ajoute un pas de buffer (comme near_horizon > horizon_nuit dans run_daily_pipeline)
+    # pour que V_near[match_idx + horizon_effectif] soit écrit par la near-DP.
+    buf = min(1, n_pf_matches - t_pf - horizon_effectif)   # 0 si déjà au bord des PF
+    t_pf_vhorizon = t_pf + horizon_effectif + buf
+    start_t_near  = match_idx + horizon_effectif + buf
+
+    if t_pf_vhorizon < n_pf_matches:
+        V_horizon_fine = V_pf_full[
+            t_pf_vhorizon, :, :, :, my_fav_alive, bob_fav_alive, pack_fav_alive
+        ]
+        # start_t_near > 0 → near-DP s'arrête ici sans réécrire le terminal
+    else:
+        # Fin de tournoi : on laisse solve_dp_coarse_exact générer le terminal signe-de-gap.
+        V_horizon_fine = np.zeros((1001, 1001, 2), dtype=np.float32)
+        start_t_near = -1
+
+    V_horizon_coarse = V_horizon_fine[::2, ::2, :].copy()
+
+    # ==========================================
+    # 3. SETUP MODE MULTI-MATCHS (scores exacts sur la nuit)
+    # ==========================================
+    exact_multi = exact_scores_by_match is not None
+    markets_by_idx = {}
+    Kmax = 3
+    if exact_multi:
+        for mid, data in exact_scores_by_match.items():
+            idx = int(mid) - 1
+            if idx < match_idx or idx >= n_matches:
+                continue
+            if is_ko[idx]:
+                # Marché CORRIGÉ 120' : fit DC sur les scores 90' ancrés au 1N2@90,
+                # convolution prolongation, ré-ancrage sur le 1N2@120 (cf. extra_time).
+                mkt, _info = build_exact_score_market_120(
+                    data, outcome_probas_90=base_true_probas_90[idx],
+                    mpp_outcome_crowd_120=base_crowds[idx], Q_A=qa_by_idx.get(idx)
+                )
+            else:
+                mkt = build_exact_score_market(
+                    data, outcome_probas=base_true_probas[idx],
+                    shape_correction=True, mpp_outcome_crowd=base_crowds[idx]
+                )
+            markets_by_idx[idx] = mkt
+            Kmax = max(Kmax, len(mkt.scores))
+        if match_idx not in markets_by_idx:
+            raise ValueError(
+                f"exact_scores_by_match : le match courant (id={match_id_cible}) doit "
+                f"figurer dans le CSV des scores exacts."
+            )
+
+    gains_f = gains_1N2.astype(np.float64) if exact_multi else None
+    pemp_f  = p_empirique_1D.astype(np.float64) if exact_multi else None
+
+    def _build_sc(true_probas):
+        sc_outcome = np.zeros((n_matches, Kmax), dtype=np.int8)
+        sc_p       = np.zeros((n_matches, Kmax), dtype=np.float64)
+        sc_cc      = np.zeros((n_matches, Kmax), dtype=np.float64)
+        sc_bonus   = np.zeros((n_matches, Kmax), dtype=np.float64)
+        sc_count   = np.zeros(n_matches, dtype=np.int64)
+        for t in range(n_matches):
+            if t in markets_by_idx:
+                m = markets_by_idx[t]
+                K = len(m.scores)
+                sc_outcome[t, :K] = np.asarray(m.outcomes, dtype=np.int8)
+                sc_p[t, :K]       = m.p_score
+                sc_cc[t, :K]      = m.cond_crowd
+                sc_bonus[t, :K]   = m.bonus
+                sc_count[t]       = K
+            else:
+                sc_outcome[t, 1] = 1
+                sc_outcome[t, 2] = 2
+                sc_p[t, :3]      = true_probas[t]
+                sc_count[t]      = 3
+        return sc_outcome, sc_p, sc_cc, sc_bonus, sc_count
+
+    # ==========================================
+    # 4. DP PROCHE EXACT-AWARE (sans drift)
+    # Démarre à start_t_near-1 et descend jusqu'à match_idx.
+    # Le buffer assure que V_near[match_idx+k+1] est écrit pour tout k < horizon_effectif.
+    # ==========================================
+    Q_near       = None
+    Q_near_floor = None
+    sc_fwd       = None
+
+    if exact_multi:
+        sc_o, sc_p_, sc_cc_, sc_b_, sc_n_ = _build_sc(base_true_probas)
+        V_near, Q_near, Q_near_floor = solve_dp_coarse_exact(
+            sc_o, sc_p_, sc_cc_, sc_b_, sc_n_,
+            gains_f, base_crowds.astype(np.float64), pemp_f, base_alphas.astype(np.float64),
+            V_horizon_coarse,
+            stop_t=match_idx, start_t=start_t_near,
+            store_q_count=horizon_effectif,
+            store_floor=True,
+        )
+        Q_near_floor = Q_near_floor.astype(np.float16)
+        sc_fwd = (sc_o, sc_p_, sc_cc_, sc_b_, sc_n_)
+    else:
+        V_near, _ = solve_dp_coarse(
+            base_true_probas=base_true_probas,
+            base_crowds=base_crowds,
+            gains_1N2=gains_1N2,
+            p_empirique_1D=p_empirique_1D,
+            alphas_isolement=base_alphas,
+            V_horizon=V_horizon_coarse,
+            stop_t=match_idx,
+            horizon_nuit=0,
+            start_t=start_t_near,
+        )
+
+    # V_nexts coarse : V_near si écrit, sinon slice PF ou terminal
+    def _v_next_coarse_pf(k):
+        nxt = match_idx + k + 1
+        if nxt < n_matches and nxt < (start_t_near if start_t_near >= 0 else n_matches):
+            return V_near[nxt]
+        t_k = t_pf + k + 1
+        if t_k < n_pf_matches:
+            return V_pf_full[t_k, :, :, :, my_fav_alive, bob_fav_alive, pack_fav_alive][::2, ::2, :]
+        return V_horizon_coarse
+
+    V_nexts_avg_coarse = np.stack([_v_next_coarse_pf(k) for k in range(horizon_effectif)])
+
+    # Upsample coarse → fine (nearest-neighbour)
+    fine_idx = np.arange(1001) // 2
+    V_nexts_avg_fine = V_nexts_avg_coarse[:, fine_idx[:, None], fine_idx[None, :], :]
+
+    # ==========================================
+    # 5. Q-TABLES PLEINE RÉSOLUTION + EXPORT ABAQUES
+    # ==========================================
+    Q_tables = np.zeros((horizon_effectif, 1001, 1001, 3, 3), dtype=np.float32)
+    for k in range(horizon_effectif):
+        t = match_idx + k
+        Q_tables[k] = compute_full_Q_table(
+            t, base_true_probas[t], base_crowds[t], gains_1N2[t],
+            p_empirique_1D, base_alphas[t], V_nexts_avg_fine[k], max_gain_dynamique
+        )
+
+    Q_table_jour = Q_tables[0]
+    if save_abaques:
+        for k in range(horizon_effectif):
+            t = match_idx + k
+            np.savez_compressed(
+                DATA_DIR / f"Abaque_Match_{t + 1}.npz",
+                q_table=Q_tables[k],
+                ev_actions=base_true_probas[t] * gains_1N2[t]
+            )
+
+    # ==========================================
+    # 6. RECOMMANDATION FINALE
+    # ==========================================
+    g1_idx = max(GAP_MIN, min(GAP_MAX, int(round(mon_gap_1)))) + GAP_OFFSET
+    g2_idx = max(GAP_MIN, min(GAP_MAX, int(round(mon_gap_2)))) + GAP_OFFSET
+    noms_choix = ["1 (Dom)", "N (Nul)", "2 (Ext)"]
+
+    # --- Mode MULTI-MATCHS ---
+    if exact_multi:
+        night_markets = OrderedDict()
+        do_forward = Q_near is not None and sc_fwd is not None
+        if do_forward:
+            sc_o, sc_p_, sc_cc_, sc_b_, sc_n_ = sc_fwd
+            g1c, g2c = g1_idx // 2, g2_idx // 2
+            P = np.zeros((501, 501, 2), dtype=np.float64)
+            P[min(g1c, g2c), max(g1c, g2c), has_booster] = 1.0
+
+        for k in range(horizon_effectif):
+            idx = match_idx + k
+            if idx in markets_by_idx:
+                if k == 0 or not do_forward:
+                    reco_m, wr_m, df_m = eval_exact_market(
+                        markets_by_idx[idx], g1_idx, g2_idx, has_booster,
+                        gains_1N2[idx], base_crowds[idx], p_empirique_1D[idx],
+                        base_alphas[idx], V_nexts_avg_fine[k], noms_choix
+                    )
+                else:
+                    reco_m, wr_m, df_m = eval_exact_market_forward(
+                        markets_by_idx[idx], P, Q_near[k], has_booster,
+                        gains_1N2[idx], noms_choix, Q_floor=Q_near_floor[k]
+                    )
+                night_markets[idx + 1] = (reco_m, wr_m, df_m)
+
+            if do_forward and (k + 1) < horizon_effectif:
+                P = forward_propagate_exact(
+                    P, sc_o[idx], sc_p_[idx], sc_cc_[idx], sc_b_[idx], int(sc_n_[idx]),
+                    gains_f[idx], base_crowds[idx].astype(np.float64),
+                    pemp_f[idx], float(base_alphas[idx]), Q_near[k]
+                )
+                p_sum = P.sum()
+                if p_sum > 0.0:
+                    P /= p_sum
+
+        for idx in sorted(markets_by_idx):
+            if (idx - match_idx) >= horizon_effectif:
+                _warnings.warn(
+                    f"Match id={idx + 1} hors horizon (k={idx - match_idx} >= "
+                    f"horizon_nuit effectif={horizon_effectif}) : reco score-exact ignorée.",
+                    stacklevel=2,
+                )
+
+        reco, best_wr, market_df = night_markets[match_id_cible]
+        return reco, best_wr, market_df, Q_table_jour, night_markets
+
+    # --- Mode SCORES EXACTS (match du jour seul) ---
+    if exact_scores_by_match is None:
+        pass  # fallback 1N2 ci-dessous
+
+    if has_booster:
+        wr_keep = Q_table_jour[g1_idx, g2_idx, :, 1]
+        wr_use  = Q_table_jour[g1_idx, g2_idx, :, 2]
+        best_keep_idx, best_use_idx = np.argmax(wr_keep), np.argmax(wr_use)
+        if wr_use[best_use_idx] > wr_keep[best_keep_idx]:
+            reco    = f"{noms_choix[best_use_idx]} + x2"
+            best_wr = wr_use[best_use_idx]
+        else:
+            reco    = f"{noms_choix[best_keep_idx]} (Safe)"
+            best_wr = wr_keep[best_keep_idx]
+    else:
+        wr_base      = Q_table_jour[g1_idx, g2_idx, :, 0]
+        best_action  = np.argmax(wr_base)
+        reco         = f"{noms_choix[best_action]}"
+        best_wr      = wr_base[best_action]
 
     return reco, best_wr, ev_actions, Q_table_jour
 

@@ -856,7 +856,8 @@ def _fit_poisson_lambdas(mpp_outcome_crowd, goal_grid=EXACT_SCORE_GOAL_GRID):
 def correct_cond_crowd(crowds_raw, scores, outcomes, mpp_outcome_crowd=None,
                        delta00=EXACT_SCORE_ZERO_ZERO_LOG_PENALTY,
                        blend_wmx=EXACT_SCORE_BLEND_WMX,
-                       goal_grid=EXACT_SCORE_GOAL_GRID):
+                       goal_grid=EXACT_SCORE_GOAL_GRID,
+                       return_global=False):
     """
     Corrige le crowd des scores exacts Winamax vers une estimation du crowd
     conditionnel MPP (modèle calibré au Notebook 25_). Renvoie le crowd CONDITIONNEL
@@ -880,6 +881,13 @@ def correct_cond_crowd(crowds_raw, scores, outcomes, mpp_outcome_crowd=None,
 
     Le bonus de score exact et la proba de bonus de Bob/peloton (DP) consomment ce
     crowd corrigé. LIMITE : blowout extrême -> sur-estimation du nombre de buts (NB25).
+
+    `return_global` (défaut False) : renvoie la distribution GLOBALE (somme 1 sur tous
+    les scores) AVANT la normalisation par outcome, au lieu du crowd conditionnel. Sert
+    à la correction 120' des phases finales (extra_time.correct_cond_crowd_120), qui a
+    besoin de la masse de crowd des nuls SUR L'ÉCHELLE GLOBALE pour la comparer au crowd
+    nul MPP et reverser l'excédent (régime nominal : blend joint normalisé globalement ;
+    régime None : forme Winamax + pénalité 0-0, normalisée globalement).
     """
     cr = np.asarray(crowds_raw, dtype=float)
     outc = np.asarray(outcomes)
@@ -897,6 +905,14 @@ def correct_cond_crowd(crowds_raw, scores, outcomes, mpp_outcome_crowd=None,
 
     # --- Régime rétro-compat : pénalité 0-0 seule sur le conditionnel Winamax ---
     if mpp_outcome_crowd is None:
+        if return_global:
+            # Forme Winamax GLOBALE (somme 1) + pénalité 0-0, sans ancrage 1N2 :
+            # conserve la sur-représentation des nuls du marché Winamax 90'.
+            if cr.sum() <= 0.0:
+                return np.zeros_like(cr)
+            gb = (cr / cr.sum()) * np.exp(delta00 * is00)
+            s = gb.sum()
+            return gb / s if s > 0.0 else gb
         out = wmx_cond.copy()
         for o in np.unique(outc):
             mask = outc == o
@@ -923,6 +939,10 @@ def correct_cond_crowd(crowds_raw, scores, outcomes, mpp_outcome_crowd=None,
     blended = a * wmx_glob + (1.0 - a) * surf_glob
     blended = blended * np.exp(delta00 * is00)
 
+    if return_global:
+        s = blended.sum()
+        return blended / s if s > 0.0 else blended
+
     out = np.zeros_like(cr)
     for o in np.unique(outc):
         mask = outc == o
@@ -937,13 +957,17 @@ def build_exact_score_market(exact_score_data, outcome_probas=None,
                              mpp_outcome_crowd=None) -> ExactScoreMarket:
     """
     Construit le marché des scores exacts à partir d'un dict
-    `{ "b1-b2": (cote, crowd_pct), ... }`. Les slots à cote absente
-    (None / <= 0) sont ignorés ; `crowd_pct` None est traité comme 0.
+    `{ "b1-b2": (cote, crowd_pct), ... }`. Un score n'est PARIABLE (présent dans le
+    marché renvoyé, avec une proba `p_score`) que s'il a une cote valide (> 0). En
+    revanche un score à cote absente MAIS avec un `crowd_pct` renseigné n'est PAS
+    jeté : son crowd compte dans la distribution (dénominateur par outcome + forme
+    Winamax), il abaisse donc le crowd conditionnel des scores pariables du même
+    outcome (on exploite tout le crowd disponible). `crowd_pct` None -> ignoré.
 
     - probas vraies via `calculate_true_outcome_probas_from_odds` (forme 1D ->
       méthode de Shin sur K issues d'UN événement) ;
     - crowd conditionnel : crowd(s) normalisé par la somme des crowds des scores
-      du MÊME outcome (cf. barème de bonus) ;
+      du MÊME outcome (scores non pariables INCLUS au dénominateur ; cf. barème) ;
     - bonus : `exact_score_bonus(cond_crowd)`.
 
     Lève ValueError si aucun score n'a de cote valide.
@@ -971,22 +995,34 @@ def build_exact_score_market(exact_score_data, outcome_probas=None,
     crowd Winamax nul) ; sinon, repli sur la seule pénalité 0-0. Mettre `shape_correction=False`
     pour récupérer le crowd Winamax brut conditionnel (cc_wmx) sans aucune correction.
     """
-    scores, odds, crowds, outcomes = [], [], [], []
+    # `scores`/`odds`/`outcomes` : scores LISTÉS = cote Pinnacle valide -> pariables (ont une
+    #   proba `p_score`). `c_*` : TOUS les scores porteurs d'info de crowd (cote OU crowd
+    #   renseigné), même sans cote -> servent à la distribution de crowd (dénominateur par
+    #   outcome + forme Winamax), sans être pariables. `c_listed` marque les pariables.
+    scores, odds, outcomes = [], [], []
+    c_scores, c_outcomes, c_vals, c_listed = [], [], [], []
     for score, data in exact_score_data.items():
         cote, crowd = data
-        if cote is None or cote <= 0:
-            continue
-        scores.append(str(score))
-        odds.append(float(cote))
-        crowds.append(float(crowd) if crowd else 0.0)
-        outcomes.append(_score_to_outcome(score))
+        o = _score_to_outcome(score)
+        valid = cote is not None and cote > 0
+        if valid:
+            scores.append(str(score))
+            odds.append(float(cote))
+            outcomes.append(o)
+        if valid or crowd is not None:
+            c_scores.append(str(score))
+            c_outcomes.append(o)
+            c_vals.append(float(crowd) if crowd else 0.0)
+            c_listed.append(valid)
 
     if not scores:
         raise ValueError("build_exact_score_market : aucun score avec une cote valide.")
 
     odds = np.asarray(odds, dtype=float)
     outcomes = np.asarray(outcomes, dtype=np.int8)
-    crowds = np.asarray(crowds, dtype=float)
+    c_outcomes = np.asarray(c_outcomes, dtype=np.int8)
+    c_vals = np.asarray(c_vals, dtype=float)
+    c_listed = np.asarray(c_listed, dtype=bool)
 
     # Probas vraies relatives (Shin sur les K cotes)
     p_score = np.asarray(calculate_true_outcome_probas_from_odds(odds), dtype=float)
@@ -1026,23 +1062,27 @@ def build_exact_score_market(exact_score_data, outcome_probas=None,
     if total > 0.0:
         p_score = p_score / total
 
-    # Crowd conditionnel : normalisation PAR OUTCOME (utilisée telle quelle si
-    # shape_correction=False ; sinon recalculée par correct_cond_crowd à partir du brut).
-    cond_crowd = np.zeros_like(crowds)
-    for o in (0, 1, 2):
-        mask = outcomes == o
-        tot = float(crowds[mask].sum())
-        if tot > 0.0:
-            cond_crowd[mask] = crowds[mask] / tot
-
-    # Correction du crowd Winamax -> MPP (NB25), AVANT le barème -> le cc corrigé pilote le
-    # bonus ET sert de proba de bonus de Bob/peloton dans la DP (evaluate_exact_score_day).
-    # Si `mpp_outcome_crowd` (1N2 MPP du match) est fourni : blend joint Winamax + surface
-    # Poisson ancrée 1N2 ; sinon repli sur la seule pénalité 0-0. On passe le crowd BRUT
-    # (correct_cond_crowd gère les normalisations par-outcome et globale).
+    # Crowd conditionnel : calculé sur TOUS les scores porteurs de crowd (`c_*`, y compris ceux
+    # SANS cote Pinnacle), puis RESTREINT aux scores listés. Inclure les scores non pariables au
+    # dénominateur abaisse correctement le crowd conditionnel des scores pariables (ex. un 5-0
+    # sans cote mais joué par la foule rend les autres victoires moins « rares »).
+    # Correction Winamax -> MPP (NB25) AVANT le barème -> le cc corrigé pilote le bonus ET sert
+    # de proba de bonus de Bob/peloton dans la DP. mpp_outcome_crowd fourni -> blend joint
+    # Winamax + surface Poisson ancrée 1N2 ; sinon repli pénalité 0-0 ; shape_correction=False
+    # -> crowd Winamax brut conditionnel.
     if shape_correction:
-        cond_crowd = correct_cond_crowd(crowds, scores, outcomes,
-                                        mpp_outcome_crowd=mpp_outcome_crowd)
+        cc_full = correct_cond_crowd(c_vals, c_scores, c_outcomes,
+                                     mpp_outcome_crowd=mpp_outcome_crowd)
+    else:
+        cc_full = np.zeros_like(c_vals)
+        for o in (0, 1, 2):
+            mask = c_outcomes == o
+            tot = float(c_vals[mask].sum())
+            if tot > 0.0:
+                cc_full[mask] = c_vals[mask] / tot
+
+    # Restriction aux listés (la sous-séquence c_listed de c_scores == `scores`, même ordre).
+    cond_crowd = cc_full[c_listed]
 
     bonus = np.asarray([exact_score_bonus(cc) for cc in cond_crowd], dtype=np.int64)
 
